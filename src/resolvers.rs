@@ -648,6 +648,46 @@ fn vet(reply: Vec<u8>, verdict: Verdict) -> Vec<u8> {
     }
 }
 
+/// One address per provider that currently **substitutes** `name`, measured now.
+///
+/// This is what the NRPT fallback list must be built from. A provider that
+/// returns the genuine Google address for a name has no business being a
+/// fallback resolver for it: the moment the relay is a little slow (a cold
+/// start is ~170 ms), Windows takes that fast genuine answer instead and caches
+/// it for its full TTL, so the region error comes back intermittently for
+/// minutes. Measured on a real machine: xbox-dns in `daily-cloudcode-pa`'s
+/// fallback list handed out 172.217/16 on roughly one query in eight.
+///
+/// Probed sequentially - a handful of queries at rule-setup time, not on the
+/// hot path - and bound to `if_index` so a tunnel does not make every provider
+/// look like a passthrough.
+pub fn substituting_addrs(name: &str, if_index: u32) -> Vec<&'static str> {
+    let query = dns_client::build_query(name, 0x6767);
+
+    let mut reference: Vec<IpAddr> = Vec::new();
+    for server in REFERENCE_V4 {
+        if let Ok(ip) = server.parse::<Ipv4Addr>() {
+            if let Ok(reply) = dns_client::query_raw_via(&query, ip, if_index, QUERY_TIMEOUT) {
+                reference.extend(dns_client::answer_addrs(&reply));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (idx, provider) in PROVIDERS.iter().enumerate() {
+        let Some(reply) = ask_provider(provider, &query, if_index) else {
+            continue;
+        };
+        let addrs = dns_client::answer_addrs(&reply);
+        if classify(&addrs, &reference, &known_proxy_addrs(idx)) == Verdict::Substituted {
+            if let Some(first) = provider.v4.first() {
+                out.push(*first);
+            }
+        }
+    }
+    out
+}
+
 /// Resolves `name` the same way, for callers that want addresses rather than a
 /// packet - `hosts_pin` writes literals, not DNS messages.
 ///
@@ -928,6 +968,33 @@ mod tests {
         learn_proxy_addrs(idx, vec![v4("87.228.47.204")]);
         learn_proxy_addrs(idx, vec![]);
         assert_eq!(known_proxy_addrs(idx), vec![v4("87.228.47.204")]);
+    }
+
+    /// Live: what the NRPT fallback list will be built from for each routed
+    /// name. `daily-cloudcode-pa` must come back with geohide only - the bug
+    /// was xbox-dns/comss (which return genuine Google for it) sitting in that
+    /// list and leaking. Run VPN-off.
+    #[test]
+    #[ignore = "needs a live network, VPN off; run with --ignored"]
+    fn substituting_addrs_excludes_passthrough_providers() {
+        for name in [
+            "cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+            "generativelanguage.googleapis.com",
+            "antigravity-unleash.goog",
+        ] {
+            let subs = substituting_addrs(name, 0);
+            println!("{:<38} substituted by {:?}", name, subs);
+            // Whatever is returned must be a real provider address, never a
+            // reference resolver - a reference in the fallback would be a leak.
+            for s in &subs {
+                assert!(
+                    !REFERENCE_V4.contains(s),
+                    "{} is a reference resolver, not a substituter",
+                    s
+                );
+            }
+        }
     }
 
     /// Live end-to-end: races the real providers and prints what each answered.
