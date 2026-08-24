@@ -212,6 +212,8 @@ pub struct BinarySummary {
     pub ok: usize,
     /// Binaries where the signature could not be found or written.
     pub failed: usize,
+    /// The last failure, so the caller can name it without this module printing.
+    pub last_error: Option<String>,
 }
 
 impl BinarySummary {
@@ -221,25 +223,26 @@ impl BinarySummary {
 }
 
 pub fn patch_all_binaries(inst: &Path) -> BinarySummary {
-    let mut summary = BinarySummary { ok: 0, failed: 0 };
+    let mut summary = BinarySummary {
+        ok: 0,
+        failed: 0,
+        last_error: None,
+    };
     for bin in binary_targets(inst) {
         let label = bin
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
+        // Deliberately silent. The caller prints one progress line per install
+        // and then its result on the same row; a line from here lands in the
+        // middle of it and pushes the result onto its own. Failures are not
+        // lost - they are counted here and named by `binary_failure_message`.
         match patch_binary(inst, &bin) {
-            Ok(0) => {
-                println!("  [OK] {} — уже пропатчен", label);
-                summary.ok += 1;
-            }
-            Ok(n) => {
-                println!("  [OK] {} — заменено вхождений: {}", label, n);
-                summary.ok += 1;
-            }
+            Ok(_) => summary.ok += 1,
             Err(e) => {
-                println!("  [ERR] {}: {}", label, e);
                 summary.failed += 1;
+                summary.last_error = Some(format!("{}: {}", label, e));
             }
         }
     }

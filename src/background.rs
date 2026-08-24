@@ -66,11 +66,33 @@ pub fn is_running() -> bool {
     })
 }
 
+/// Kills the running relay and waits for it to actually let go.
+///
+/// `taskkill /F` returns once the kill is *requested*, not once the process has
+/// exited and released its image file. Copying over it immediately then fails
+/// with os error 32 - "the file is in use by another process" - which is what a
+/// user upgrading from an older relay saw instead of an install. Reported from
+/// a real machine, never reproduced here, because it only happens when a relay
+/// is already running.
 fn stop_process() {
     let mut cmd = Command::new("taskkill");
     cmd.args(["/F", "/IM", EXE_NAME]);
     no_window(&mut cmd).output().ok();
+
+    for _ in 0..STOP_WAIT_TRIES {
+        if !is_running() {
+            // Even gone from the task list, the image handle can outlive the
+            // process by a moment. Cheaper to pause once than to explain a
+            // failed upgrade.
+            thread::sleep(STOP_SETTLE);
+            return;
+        }
+        thread::sleep(STOP_SETTLE);
+    }
 }
+
+const STOP_SETTLE: Duration = Duration::from_millis(300);
+const STOP_WAIT_TRIES: usize = 10;
 
 /// Copies this exe next to its log and registers the logon task. The copy is
 /// what makes autostart survive the user moving or deleting the download; it is
@@ -84,7 +106,7 @@ pub fn enable() -> Result<(), String> {
     // The file cannot be replaced while the previous relay holds it open.
     stop_process();
     if src != dst {
-        fs::copy(&src, &dst).map_err(|e| format!("не скопировать exe: {}", e))?;
+        copy_over(&src, &dst)?;
     }
 
     // S4U is what keeps the logon silent. A task action run under the default
@@ -153,6 +175,29 @@ pub fn enable() -> Result<(), String> {
 /// a UPX-packed exe to unpack and bind, short enough not to stall the menu.
 const RELAY_START_SETTLE: Duration = Duration::from_millis(1200);
 const RELAY_START_TRIES: usize = 3;
+
+/// Replaces `dst` with `src`, retrying while the old file is still held.
+///
+/// Belt and braces on top of `stop_process`: whatever it is that holds the image
+/// open - antivirus reading it, the loader unmapping it - is transient, and a
+/// second of patience beats an upgrade that silently does not happen.
+fn copy_over(src: &Path, dst: &Path) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..COPY_TRIES {
+        match fs::copy(src, dst) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last = e.to_string();
+                if attempt + 1 < COPY_TRIES {
+                    thread::sleep(STOP_SETTLE);
+                }
+            }
+        }
+    }
+    Err(format!("не скопировать exe: {}", last))
+}
+
+const COPY_TRIES: usize = 6;
 
 fn same_file_bytes(a: &Path, b: &Path) -> bool {
     match (fs::read(a), fs::read(b)) {

@@ -161,7 +161,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.9.1_20"
+    VERSION = "2.9.1_21"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.

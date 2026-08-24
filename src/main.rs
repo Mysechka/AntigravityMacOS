@@ -325,6 +325,8 @@ fn process_install(install: &Path) -> Result<String, String> {
 fn binary_failure_message(summary: &patch_binary::BinarySummary) -> String {
     if summary.total() == 0 {
         "Бинарник Language Server / CLI не найден в этой установке".to_string()
+    } else if let Some(err) = &summary.last_error {
+        err.clone()
     } else {
         "Сигнатура в Language Server не найдена — вероятно, вышла новая версия Antigravity"
             .to_string()
