@@ -2,6 +2,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use crate::dns_forwarder;
 use crate::utils::{no_window, powershell};
@@ -18,6 +20,11 @@ use crate::utils::{no_window, powershell};
 // of the latter are wrong here in two ways that only surface on a laptop weeks
 // later - a task is stopped when the machine goes on battery, and it is killed
 // after a 72-hour execution limit. Both are switched off explicitly below.
+//
+// It also restarts on failure. The relay is compiled with `panic = "abort"`, so
+// any thread that goes down takes the whole process with it - and with it the
+// DNS the routed names depend on, until the next logon. A restart policy is the
+// only backstop available for that, since the panic cannot be caught.
 
 const TASK_NAME: &str = "AG Unlocker DNS";
 const EXE_NAME: &str = "ag_dns.exe";
@@ -93,7 +100,8 @@ pub fn enable() -> Result<(), String> {
          $t=New-ScheduledTaskTrigger -AtLogOn; \
          $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries \
               -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
-              -ExecutionTimeLimit ([TimeSpan]::Zero); \
+              -ExecutionTimeLimit ([TimeSpan]::Zero) \
+              -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
          $d='Antigravity Unlocker: локальный DNS-релей'; \
          try {{ \
            $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
@@ -118,8 +126,33 @@ pub fn enable() -> Result<(), String> {
             stderr
         });
     }
-    Ok(())
+    // Stamped here rather than left to the relay: the answer has to be right the
+    // moment the upgrade finishes, not a second later when the new process gets
+    // around to writing it, or the menu redraws still saying "outdated".
+    dns_forwarder::record_version();
+
+    // Registering the task is not the same as the relay running. It is a console
+    // process that exits 1 when it cannot bind 127.0.0.53:53, and the previous
+    // one can still be holding the socket for a moment after `stop_process()`
+    // returned - the task then sits at Ready with LastTaskResult 1 and there is
+    // no relay, while this function has already reported success. Observed
+    // exactly once, which is once more than a silent one should happen.
+    for attempt in 0..RELAY_START_TRIES {
+        thread::sleep(RELAY_START_SETTLE);
+        if is_running() {
+            return Ok(());
+        }
+        if attempt + 1 < RELAY_START_TRIES {
+            powershell(&format!("Start-ScheduledTask -TaskName '{}'", TASK_NAME));
+        }
+    }
+    Err("задача создана, но релей не запустился".to_string())
 }
+
+/// How long to give the relay to appear before trying again. Generous enough for
+/// a UPX-packed exe to unpack and bind, short enough not to stall the menu.
+const RELAY_START_SETTLE: Duration = Duration::from_millis(1200);
+const RELAY_START_TRIES: usize = 3;
 
 fn same_file_bytes(a: &Path, b: &Path) -> bool {
     match (fs::read(a), fs::read(b)) {
@@ -139,6 +172,19 @@ fn installed_copy_is_current() -> bool {
         Ok(src) => same_file_bytes(&src, &installed_exe()),
         Err(_) => false,
     }
+}
+
+/// True when a relay is installed and it is an older generation than this build
+/// ships - the case the user has to be told about, because the relay keeps
+/// running from `%ProgramData%` across reboots and a newer unlocker on its own
+/// changes nothing about it.
+///
+/// Deliberately two cheap filesystem calls and no PowerShell: the menu redraws
+/// around this, and `is_enabled()` costs a few hundred milliseconds. The exe
+/// being there is what makes "no version file" mean "a relay from before
+/// versioning" rather than "no relay at all".
+pub fn relay_is_outdated() -> bool {
+    installed_exe().exists() && dns_forwarder::installed_version() < dns_forwarder::RELAY_VERSION
 }
 
 /// Brings the relay up, reinstalling it whenever the installed copy is not this
@@ -161,6 +207,7 @@ pub fn disable() -> Result<(), String> {
     stop_process();
     fs::remove_file(installed_exe()).ok();
     fs::remove_file(dns_forwarder::log_path()).ok();
+    fs::remove_file(dns_forwarder::version_path()).ok();
     // Both only succeed while the directory is empty, which is what we want.
     fs::remove_dir(install_dir()).ok();
     fs::remove_dir(dns_forwarder::log_dir()).ok();

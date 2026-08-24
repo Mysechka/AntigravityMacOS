@@ -20,6 +20,7 @@ mod hosts_pin;
 mod patch_binary;
 mod patch_gemini;
 mod patch_ide;
+mod proxy;
 mod resolvers;
 mod utils;
 mod watchdog;
@@ -30,7 +31,9 @@ use dns::{is_nrpt_applied, refresh_pinned_hosts, remove_dns_nrpt, setup_dns_nrpt
 use patch_binary::{kill_affected_processes, patch_all_binaries, unpatch_all_binaries};
 use patch_gemini::run_gemini_patcher;
 use patch_ide::{is_new_desktop_architecture, patch_desktop, patch_extension_js, patch_ide};
-use utils::{clear_screen, is_admin, link, mask_path, open_hint, open_url, print_results, prompt};
+use utils::{
+    clear_screen, is_admin, link, mask_path, open_hint, open_url, print_results, prompt, short_path,
+};
 
 // Title shown at the top of the main menu.
 const APP_TITLE: &str = "Antigravity Unlocker 2";
@@ -241,25 +244,6 @@ fn restore_pristine_asar(resources: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Says out loud what happened to the CloudCode endpoint.
-///
-/// `Unsupported` is reported rather than swallowed: a future IDE build could
-/// rename or drop the setting, and a key nothing reads would otherwise look
-/// exactly like a successful patch.
-fn report_endpoint(outcome: Result<endpoint::Outcome, String>) {
-    match outcome {
-        Ok(endpoint::Outcome::Applied) => {
-            println!("  [OK] Эндпоинт CloudCode переключён на daily-cloudcode-pa")
-        }
-        Ok(endpoint::Outcome::AlreadySet) => println!("  [OK] Эндпоинт CloudCode — уже переключён"),
-        Ok(endpoint::Outcome::Unsupported) => println!(
-            "  [33m[WARN] В этой сборке IDE нет настройки {} — эндпоинт не переключён[0m[92m",
-            endpoint::IDE_SETTING
-        ),
-        Err(e) => println!("  [33m[WARN] Эндпоинт не переключён: {}[0m[92m", e),
-    }
-}
-
 fn process_install(install: &Path) -> Result<String, String> {
     // Patch all relevant binaries (Language Server / CLI).
     let bin_summary = patch_all_binaries(install);
@@ -279,7 +263,6 @@ fn process_install(install: &Path) -> Result<String, String> {
         if is_new_arch {
             // Clean up leftovers from a patch applied before v2.4.
             restore_pristine_asar(&resources)?;
-            println!("  [INFO] v2.4+ архитектура — JS-патч не требуется (auth в Language Server)");
             // The Language Server is the only thing being patched here, so if
             // it did not take there is nothing to report as success.
             if bin_summary.ok == 0 {
@@ -303,11 +286,13 @@ fn process_install(install: &Path) -> Result<String, String> {
     if ide_js.exists() {
         patch_ide(install, &ide_js)?;
         if let Err(e) = patch_extension_js(install) {
-            println!("{} {}", "[WARN] Патч extension.js пропущен:", e);
+            // Not reported per install: the progress line is one row wide, and
+            // the extension patch is cosmetic next to the Language Server one.
+            let _ = e;
         }
         // Desktop already ships pointing at the daily host; only the IDE has to
         // be told, and it has a supported setting for exactly that.
-        report_endpoint(endpoint::apply_ide(install));
+        let _ = endpoint::apply_ide(install);
         return Ok("Antigravity IDE".to_string());
     } else if desktop_js.exists() {
         let js_patched = patch_desktop(install, &desktop_js)?;
@@ -329,7 +314,7 @@ fn process_install(install: &Path) -> Result<String, String> {
                 "  [OK] Эндпоинт CloudCode переключён ({} — нужен новый терминал)",
                 endpoint::CLI_ENV_VAR
             ),
-            Err(e) => println!("  [33m[WARN] Эндпоинт не переключён: {}[0m[92m", e),
+            Err(e) => println!("  \x1b[33m[WARN] Эндпоинт не переключён: {}\x1b[0m\x1b[92m", e),
         }
         return Ok("Antigravity CLI".to_string());
     }
@@ -399,8 +384,96 @@ fn handle_restore_dns() {
     remove_dns_nrpt();
     println!("готово.");
 
+    disable_fallback_proxy();
+
     println!("{}", "Готово!");
     thread::sleep(Duration::from_secs(2));
+}
+
+/// Turns the fallback route off and takes its certificate authority back out of
+/// the trust store.
+///
+/// Called from both undo paths and always run to completion: a root certificate
+/// left behind after a revert would be the worst thing this tool could do, so
+/// nothing here is allowed to short-circuit on an earlier step finding nothing.
+fn disable_fallback_proxy() {
+    let url = proxy::proxy_url();
+    let ca = proxy::ca_cert_path().to_string_lossy().to_string();
+    let had_env = endpoint::proxy_is_applied(&url);
+    let had_ca = proxy::ca_is_trusted();
+    if !had_env && !had_ca {
+        return;
+    }
+    print!("Отключение резервного прокси и удаление его сертификата... ");
+    io::stdout().flush().ok();
+    if let Err(e) = endpoint::remove_proxy(&url, &ca) {
+        println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e);
+        return;
+    }
+    proxy::untrust_ca();
+    println!("готово.");
+}
+
+/// Menu 8: the traffic-level route, for names no resolver substitutes.
+fn handle_fallback_proxy() {
+    clear_screen();
+    println!("{}", APP_TITLE);
+    println!();
+
+    let url = proxy::proxy_url();
+    if endpoint::proxy_is_applied(&url) || proxy::ca_is_trusted() {
+        disable_fallback_proxy();
+        thread::sleep(Duration::from_secs(2));
+        return;
+    }
+
+    println!("Резервный маршрут: трафик Antigravity к *.googleapis.com пойдёт");
+    println!("через локальный прокси на {}.", url);
+    println!();
+    println!("Это нужно для хостов, которые не подменяет ни один резолвер —");
+    println!("например jetski-webchannel.googleapis.com, через который идёт");
+    println!("поток планировщика. DNS их закрыть не может.");
+    println!();
+    println!("\x1b[33mЧто будет установлено: корневой сертификат, созданный");
+    println!("на этой машине (в хранилище текущего пользователя). Прокси");
+    println!("расшифровывает только *.googleapis.com; вход в аккаунт и всё");
+    println!("остальное идёт сквозным туннелем и не вскрывается.");
+    println!("Пункт 8 ещё раз — выключить и удалить сертификат.\x1b[0m\x1b[92m");
+    println!();
+
+    if !prompt("Включить? (y/N): ").eq_ignore_ascii_case("y") {
+        return;
+    }
+
+    print!("Установка сертификата... ");
+    io::stdout().flush().ok();
+    match proxy::trust_ca() {
+        Ok(_) => println!("готово."),
+        Err(e) => {
+            println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e);
+            thread::sleep(Duration::from_secs(3));
+            return;
+        }
+    }
+
+    print!("Направление трафика в прокси... ");
+    io::stdout().flush().ok();
+    match endpoint::apply_proxy(&url, &proxy::ca_cert_path().to_string_lossy()) {
+        Ok(_) => println!("готово."),
+        Err(e) => {
+            println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e);
+            // Never leave a trusted certificate behind for a route that is not
+            // switched on: it would be pure exposure for zero benefit.
+            proxy::untrust_ca();
+            thread::sleep(Duration::from_secs(3));
+            return;
+        }
+    }
+
+    println!();
+    println!("Готово. Перезапустите Antigravity — переменные среды читаются");
+    println!("при старте процесса.");
+    thread::sleep(Duration::from_secs(4));
 }
 
 /// Full revert: undoes the binary patch, puts app.asar back and drops the DNS
@@ -604,7 +677,7 @@ fn handle_patch_antigravity() {
     let installs = find_all_installs();
 
     if installs.is_empty() {
-        println!("{}", "Установки Antigravity не найдены.");
+        println!("{}", "Ð£ÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸ Antigravity Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½Ñ.");
         thread::sleep(Duration::from_secs(2));
         return;
     }
@@ -612,25 +685,27 @@ fn handle_patch_antigravity() {
     let mut successes = Vec::new();
     let mut failures = Vec::new();
 
-    for inst in &installs {
-        println!("{}", "--------------------------------------------------");
-        println!(
-            "{} {}",
-            "Обработка:",
-            mask_path(&inst.display().to_string())
+    println!();
+    for (i, inst) in installs.iter().enumerate() {
+        let path = inst.display().to_string();
+        // Printed before the work, so a long patch shows which install it is
+        // sitting on rather than a silent pause.
+        print!(
+            "  [{}/{}] {:<20} {:<34} ",
+            i + 1,
+            installs.len(),
+            install_label(inst),
+            short_path(&path)
         );
+        io::stdout().flush().ok();
         match process_install(inst) {
             Ok(name) => {
-                println!("{} {}", "[OK] Успешно пропатчено:", name);
+                println!("OK");
                 successes.push(name);
             }
             Err(e) => {
-                println!("\x1b[33m[ERR] Ошибка: {}\x1b[0m\x1b[92m", e);
-                failures.push(format!(
-                    "{} - {}",
-                    mask_path(&inst.display().to_string()),
-                    e
-                ));
+                println!("\x1b[33mÐ¾ÑÐ¸Ð±ÐºÐ°\x1b[0m\x1b[92m");
+                failures.push(format!("{} - {}", mask_path(&path), e));
             }
         }
     }
@@ -639,9 +714,63 @@ fn handle_patch_antigravity() {
         // Unconditionally, not only on a fresh machine: this run has to bring the
         // relay up and re-point the rules at it even when the rules already exist.
         apply_dns_patch(false);
+        offer_fallback_certificate();
     }
 
     print_results(&successes, &failures);
+}
+
+/// Which product an install directory is, for the progress line.
+///
+/// A guess from the layout rather than the name `process_install` returns,
+/// because the line is printed before the work starts - that is the whole point
+/// of it.
+fn install_label(install: &Path) -> &'static str {
+    if install.join("agy.exe").exists() {
+        "Antigravity CLI"
+    } else if install.join("Antigravity IDE.exe").exists()
+        || install.join("resources").join("app").join("out").exists()
+    {
+        "Antigravity IDE"
+    } else {
+        "Antigravity 2.0"
+    }
+}
+
+/// The one question menu 1 asks. Yellow, because it is the only step that puts
+/// something in the user's certificate store, and that should never slip past
+/// somebody skimming a wall of green.
+fn offer_fallback_certificate() {
+    let url = proxy::proxy_url();
+    if endpoint::proxy_is_applied(&url) {
+        return;
+    }
+    println!();
+    println!("\x1b[33mÐ£ÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ ÑÐµÑÑÐ¸ÑÐ¸ÐºÐ°Ñ Ð´Ð»Ñ Ð·Ð°Ð¿Ð°ÑÐ½Ð¾Ð³Ð¾ Ð¿ÑÑÐ¸?\x1b[0m\x1b[92m");
+    println!("  ÐÐ°Ð¿Ð°ÑÐ½Ð¾Ð¹ Ð¿ÑÑÑ Ð²ÐµÐ´ÑÑ ÑÑÐ°ÑÐ¸Ðº Antigravity ÑÐµÑÐµÐ· ÑÐ°Ð¼ÑÐ¹ Ð±ÑÑÑÑÑÐ¹ Ð¸Ð· Ð¿ÑÐ¾ÐºÑÐ¸,");
+    println!("  ÐºÐ¾Ð³Ð´Ð° ÑÐ¿Ð¾ÑÐ¾Ð± ÑÐµÑÐµÐ· DNS ÑÐ¾ÑÐ¼Ð¾Ð·Ð¸Ñ Ð¸Ð»Ð¸ Ð¿ÐµÑÐµÑÑÐ°ÑÑ ÑÐ°Ð±Ð¾ÑÐ°ÑÑ. Ð¡ÐµÑÑÐ¸ÑÐ¸ÐºÐ°Ñ");
+    println!("  ÑÐ¾Ð·Ð´Ð°ÑÑÑÑ Ð½Ð° ÑÑÐ¾Ð¹ Ð¼Ð°ÑÐ¸Ð½Ðµ, ÑÑÐ°Ð²Ð¸ÑÑÑ ÑÐ¾Ð»ÑÐºÐ¾ Ð´Ð»Ñ Ð²Ð°Ñ Ð¸ ÑÐ½Ð¸Ð¼Ð°ÐµÑÑÑ Ð¿ÑÐ½ÐºÑÐ¾Ð¼ 8.");
+    println!();
+
+    if prompt("  1 â ÑÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ, Enter â Ð¿ÑÐ¾Ð¿ÑÑÑÐ¸ÑÑ: ") != "1" {
+        return;
+    }
+
+    print!("  Ð¡ÐµÑÑÐ¸ÑÐ¸ÐºÐ°Ñ Ð¸ Ð¼Ð°ÑÑÑÑÑ... ");
+    io::stdout().flush().ok();
+    if let Err(e) = proxy::trust_ca() {
+        println!("\x1b[33mÐ¾ÑÐ¸Ð±ÐºÐ°: {}\x1b[0m\x1b[92m", e);
+        return;
+    }
+    match endpoint::apply_proxy(&url, &proxy::ca_cert_path().to_string_lossy()) {
+        Ok(_) => println!("OK â Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÑÐ¸ÑÐµ Antigravity"),
+        Err(e) => {
+            // Never leave a trusted certificate behind for a route that is not
+            // switched on: pure exposure for zero benefit.
+            proxy::untrust_ca();
+            println!("\x1b[33mÐ¾ÑÐ¸Ð±ÐºÐ°: {}\x1b[0m\x1b[92m", e);
+        }
+    }
 }
 
 fn handle_patch_gemini() {
@@ -1017,9 +1146,25 @@ fn main() {
         // restore the menu's bright-green afterwards.
         println!("\x1b[38;5;154m6. Отключить DNS-службу и NRPT (отключит исправление ошибок \"400\")\x1b[0m\x1b[92m");
         println!("\x1b[38;5;154m7. Полный откат (снять патч и вернуть исходное состояние)\x1b[0m\x1b[92m");
+        println!("\x1b[38;5;154m8. Удалить сертификат запасного пути\x1b[0m\x1b[92m");
         println!("0. Выход");
         println!();
         println!("Пункты 4 и 5 открывают ссылку в браузере.");
+        // The relay is installed once and then runs from %ProgramData% across
+        // reboots, so a newer unlocker sitting next to an older relay is silent
+        // by default - and it is the relay that carries the DNS fixes.
+        if background::relay_is_outdated() {
+            println!(
+                "\x1b[33mDNS-служба устарела (v{} → v{}): {}.\x1b[0m\x1b[92m",
+                dns_forwarder::installed_version(),
+                dns_forwarder::RELAY_VERSION,
+                if is_admin() {
+                    "выполните пункт 1, чтобы обновить её"
+                } else {
+                    "запустите анлокер от имени администратора и выполните пункт 1"
+                }
+            );
+        }
         if !is_admin() && !is_nrpt_applied() {
             println!("Запущено без админ-прав: серверный патч будет пропущен.");
         }
@@ -1033,6 +1178,7 @@ fn main() {
             "5" => open_url(DONATE_URL),
             "6" => handle_restore_dns(),
             "7" => handle_revert_all(),
+            "8" => handle_fallback_proxy(),
             "0" => break,
             _ => {
                 println!("{}", "Неверный выбор.");

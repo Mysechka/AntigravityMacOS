@@ -36,6 +36,13 @@ const AG_NRPT_CORE: &[&str] = &[
 // Only needed for the Gemini CLI flow (the API-key page must open in a browser).
 const AG_NRPT_GEMINI: &[&str] = &["aistudio.google.com"];
 
+/// The names an NRPT rule always points at the relay - and therefore the ones
+/// the relay keeps a fresh answer for. Warming anything else would put queries
+/// on a third party for names Windows never sends here.
+pub fn core_namespaces() -> &'static [&'static str] {
+    AG_NRPT_CORE
+}
+
 // The unblock resolvers live in `resolvers` - the rules and the relay have to
 // name the same services, and which of them actually substitutes a given name
 // is decided per query rather than assumed here.

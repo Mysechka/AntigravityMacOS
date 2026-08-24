@@ -291,6 +291,102 @@ pub fn without_addrs(reply: &[u8], drop: &[IpAddr]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// An OPT record. Its "TTL" field carries the extended rcode, version and the
+/// DO bit rather than a lifetime, so anything that reads or writes TTLs has to
+/// step over it.
+const RTYPE_OPT: u16 = 41;
+
+/// Where every record's TTL field sits, with the record's type, across the
+/// answer, authority and additional sections.
+///
+/// `None` for anything that cannot be walked to the end: a caller that does not
+/// know the shape of a message has no business editing it.
+fn ttl_fields(buf: &[u8]) -> Option<Vec<(usize, u16)>> {
+    if buf.len() < 12 {
+        return None;
+    }
+    let questions = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let records = u16::from_be_bytes([buf[6], buf[7]]) as usize
+        + u16::from_be_bytes([buf[8], buf[9]]) as usize
+        + u16::from_be_bytes([buf[10], buf[11]]) as usize;
+
+    let mut i = 12;
+    for _ in 0..questions {
+        i = skip_name(buf, i)?.checked_add(4)?;
+        if i > buf.len() {
+            return None;
+        }
+    }
+
+    let mut out = Vec::with_capacity(records);
+    for _ in 0..records {
+        let after_name = skip_name(buf, i)?;
+        if after_name + 10 > buf.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([buf[after_name], buf[after_name + 1]]);
+        let rdlen = u16::from_be_bytes([buf[after_name + 8], buf[after_name + 9]]) as usize;
+        out.push((after_name + 4, rtype));
+        i = after_name.checked_add(10)?.checked_add(rdlen)?;
+        if i > buf.len() {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// The smallest TTL in the answer section - how long the whole reply is good
+/// for. `None` when there is no timed record to read one from.
+pub fn answer_ttl(reply: &[u8]) -> Option<u32> {
+    let answers = u16::from_be_bytes([*reply.get(6)?, *reply.get(7)?]) as usize;
+    ttl_fields(reply)?
+        .into_iter()
+        .take(answers)
+        .filter(|(_, rtype)| *rtype != RTYPE_OPT)
+        .map(|(at, _)| u32::from_be_bytes([reply[at], reply[at + 1], reply[at + 2], reply[at + 3]]))
+        .min()
+}
+
+/// Rewrites every record's TTL through `f`, in place.
+///
+/// Safe where `without_addrs` has to be careful: only the four TTL bytes of each
+/// record change, so nothing moves and every compression pointer in the message
+/// stays valid whatever shape it has. OPT is skipped. `None` means the message
+/// could not be walked - the caller's cue to hand back the original rather than
+/// to edit a message it does not understand.
+fn rewrite_ttls(reply: &[u8], f: impl Fn(u32) -> u32) -> Option<Vec<u8>> {
+    let fields = ttl_fields(reply)?;
+    let mut out = reply.to_vec();
+    for (at, rtype) in fields {
+        if rtype == RTYPE_OPT {
+            continue;
+        }
+        let ttl = u32::from_be_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]]);
+        // A record that was already at zero stays there; anything else keeps at
+        // least a second, so a rewritten answer never reads as "do not cache".
+        let next = if ttl == 0 { 0 } else { f(ttl).max(1) };
+        out[at..at + 4].copy_from_slice(&next.to_be_bytes());
+    }
+    Some(out)
+}
+
+/// Ages every record in `reply` by `seconds`, so an answer served out of memory
+/// expires when the resolver said it would rather than `seconds` later.
+pub fn age_reply(reply: &[u8], seconds: u32) -> Option<Vec<u8>> {
+    rewrite_ttls(reply, |ttl| ttl.saturating_sub(seconds))
+}
+
+/// Clamps every record's TTL to at most `seconds`.
+///
+/// The relay needs this because a TTL is the resolver's opinion about its own
+/// answer, and an answer that failed to defeat the region gate has no business
+/// being believed for as long as the resolver would like: comss hands out the
+/// genuine Google address for `daily-cloudcode-pa` with a TTL of 3199 s, which
+/// pins the client to it for the best part of an hour.
+pub fn cap_ttl(reply: &[u8], seconds: u32) -> Option<Vec<u8>> {
+    rewrite_ttls(reply, |ttl| ttl.min(seconds))
+}
+
 /// The qtype of the question. Only A and AAAA answers can be compared against a
 /// reference resolver, so the relay has to know which it is looking at.
 pub fn question_type(buf: &[u8]) -> Option<u16> {
@@ -549,5 +645,55 @@ mod tests {
         b.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0x00, 0x04]);
         b.extend_from_slice(&[9, 9, 9, 9]);
         assert_eq!(parse_a_records(&b, 7), vec![Ipv4Addr::new(9, 9, 9, 9)]);
+    }
+
+    #[test]
+    fn the_answer_ttl_is_the_shortest_one() {
+        let mut msg = reply_with(9, &[[1, 1, 1, 1], [2, 2, 2, 2]], true);
+        assert_eq!(answer_ttl(&msg), Some(60));
+        // Second record down to 30: the reply is only good for the shorter one.
+        // It ends where the 11-byte OPT begins, and its last 10 bytes are
+        // ttl(4) + rdlength(2) + a 4-byte address.
+        let ttl_at = msg.len() - 11 - 10;
+        msg[ttl_at..ttl_at + 4].copy_from_slice(&30u32.to_be_bytes());
+        assert_eq!(answer_ttl(&msg), Some(30));
+    }
+
+    #[test]
+    fn ageing_shortens_every_record_and_moves_nothing() {
+        let msg = reply_with(9, &[[1, 1, 1, 1], [2, 2, 2, 2]], true);
+        let aged = age_reply(&msg, 25).unwrap();
+        assert_eq!(aged.len(), msg.len());
+        assert_eq!(answer_ttl(&aged), Some(35));
+        // The addresses still parse, i.e. the pointers still point where they did.
+        assert_eq!(answer_addrs(&aged), answer_addrs(&msg));
+    }
+
+    /// An OPT record's TTL field is the extended rcode, version and DO bit.
+    /// Ageing it would silently turn a plain reply into a DNSSEC-flagged one.
+    #[test]
+    fn the_opt_record_is_not_aged() {
+        let msg = reply_with(9, &[[1, 1, 1, 1]], true);
+        let opt = msg.len() - 11;
+        let aged = age_reply(&msg, 30).unwrap();
+        assert_eq!(&aged[opt..], &msg[opt..]);
+    }
+
+    #[test]
+    fn ageing_past_the_ttl_leaves_a_second_rather_than_zero() {
+        let msg = reply_with(9, &[[1, 1, 1, 1]], false);
+        assert_eq!(answer_ttl(&age_reply(&msg, 9_000).unwrap()), Some(1));
+    }
+
+    #[test]
+    fn ageing_a_message_it_cannot_walk_returns_none() {
+        let msg = reply_with(9, &[[1, 1, 1, 1], [2, 2, 2, 2]], true);
+        for cut in 0..msg.len() {
+            let _ = age_reply(&msg[..cut], 5);
+            let _ = answer_ttl(&msg[..cut]);
+        }
+        let mut lying = msg.clone();
+        lying[7] = 0x40; // claim 64 answers, ship two
+        assert!(age_reply(&lying, 5).is_none());
     }
 }

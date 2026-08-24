@@ -6,8 +6,10 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::dns;
 use crate::dns_client;
 use crate::egress;
+use crate::proxy;
 use crate::resolvers::{self, Verdict};
 
 // A loopback DNS relay, so the answers stay fresh.
@@ -36,6 +38,39 @@ use crate::resolvers::{self, Verdict};
 /// recognisable and clear of anything bound to 127.0.0.1.
 pub const LISTEN_IP: &str = "127.0.0.53";
 pub const LISTEN_PORT: u16 = 53;
+
+/// What generation of relay this build ships.
+///
+/// Separate from the product version on purpose: the relay is installed once,
+/// by an administrator, and then keeps running across reboots from
+/// `%ProgramData%` - so a user can be running a months-old relay under a fresh
+/// unlocker and never be told. The unlocker compares this against what the
+/// installed relay wrote and says so.
+///
+/// **Bump this whenever the relay's own behaviour changes** - the loop, the
+/// resolver logic it carries, the warm loop, the watchdog. A pure UI or patcher
+/// change does not need it. Never decrease it: the comparison is "older than",
+/// and a version that goes backwards asks every user to reinstall.
+///
+/// 1 = first versioned relay: answer cache + warm loop.
+/// 2 = a non-substituted answer can no longer pin the client for its own TTL.
+/// 3 = carries the fallback proxy (`proxy.rs`) alongside the DNS relay.
+/// 4 = the proxy no longer answers a socket the client has not spoken on.
+/// 5 = identity and telemetry hosts are tunnelled, never intercepted.
+/// 6 = liveness is re-probed on the warm loop, so a dead address is dropped
+///     within seconds instead of being advertised for ten minutes.
+/// 7 = a provider choice is only remembered when it actually substituted.
+/// 8 = the race log is client-only, so it stops eating its own log budget.
+/// 9 = the warm loop gets a generous liveness budget; the client path stays tight.
+/// 10 = `enable()` verifies the relay came up instead of trusting the task.
+/// 11 = liveness is measured by the TLS handshake, not just the connection.
+/// 12 = the fallback route picks its upstream by measured handshake latency.
+/// 13 = the byte pump is non-blocking, so it stops adding its own latency.
+pub const RELAY_VERSION: u32 = 16;
+
+/// Written where an unelevated relay can write and an unelevated unlocker can
+/// read. Absent means a relay from before versioning, i.e. older than anything.
+const VERSION_FILE: &str = "relay.version";
 
 /// Closes the console Windows hands a console subsystem process. Without this
 /// the scheduled task leaves an empty black window on screen for as long as the
@@ -92,6 +127,34 @@ pub fn log_path() -> PathBuf {
     log_dir().join("forwarder.log")
 }
 
+pub fn version_path() -> PathBuf {
+    log_dir().join(VERSION_FILE)
+}
+
+/// Records which relay generation is in place. Called both by the installer and
+/// by the relay itself at startup: the installer's write is what makes the
+/// answer correct the moment an upgrade finishes, and the relay's write is what
+/// keeps it honest if the exe ever gets there some other way.
+pub fn record_version() {
+    if let Some(dir) = version_path().parent() {
+        fs::create_dir_all(dir).ok();
+    }
+    fs::write(version_path(), RELAY_VERSION.to_string()).ok();
+}
+
+/// The relay generation currently installed. `0` for a relay old enough not to
+/// have written one - which is exactly the case worth reporting.
+pub fn installed_version() -> u32 {
+    parse_version(fs::read_to_string(version_path()).ok().as_deref())
+}
+
+/// Anything unreadable counts as the oldest possible relay: the file is written
+/// by us and never edited, so a value that will not parse means something else
+/// wrote it, and "reinstall" is the right answer to that too.
+fn parse_version(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
 /// Best-effort logging: a background process with no console is otherwise
 /// impossible to diagnose. Truncated rather than rotated - nothing here is
 /// worth keeping across sessions.
@@ -111,6 +174,25 @@ fn log(line: &str) {
 /// The only way a failed start can be reported: the console is gone by then.
 pub fn log_fatal(message: &str) {
     log(&format!("fatal: {}", message));
+}
+
+/// The proxy shares the relay's log - it runs in the same process, and one file
+/// is what makes a resolve and the connection that followed it readable together.
+pub fn log_proxy(message: &str) {
+    log(&format!("proxy        {}", message));
+}
+
+/// Who answered a race that produced no substitution, and whether a reference
+/// was available to judge it. Only logged on that path: it is the one where the
+/// interesting question is which provider was missing, and it is rare enough
+/// that a line per occurrence is affordable.
+pub fn log_race(name: &str, heard: &[&str], had_reference: bool) {
+    log(&format!(
+        "race         {} heard [{}]{}",
+        name,
+        heard.join(", "),
+        if had_reference { "" } else { " (no reference)" }
+    ));
 }
 
 fn invalidate_interface() {
@@ -161,6 +243,42 @@ fn relay(query: &[u8]) -> Option<(Vec<u8>, &'static str, resolvers::Verdict)> {
     }
 }
 
+/// How often the routed names are re-resolved in the background.
+///
+/// Half the substituted TTL, so an entry is always well inside the window the
+/// answer cache will serve it from and a client query never finds it expired.
+/// Cheap: four names, one upstream query each, once every quarter minute.
+const WARM_EVERY: Duration = Duration::from_secs(15);
+/// How often the fallback route re-measures which proxy is quickest.
+const UPSTREAM_EVERY: Duration = Duration::from_secs(3 * 60);
+
+/// Keeps a vetted answer ready for every routed name, forever.
+///
+/// The relay has about a second to answer before Windows asks the next
+/// nameserver in the NRPT rule - which is a provider's own resolver, handing
+/// out addresses that nothing has checked for liveness. A cold resolution does
+/// not reliably fit in that second (race, then a liveness probe, and a provider
+/// that goes quiet costs the whole timeout), and it does not have to: doing the
+/// work on a timer instead means the client's query is answered from memory.
+fn warm_forever() {
+    let mut since_upstream = UPSTREAM_EVERY;
+    loop {
+        let egress = isp_interface();
+        // Measured before the names are warmed, not after. A client reconnects
+        // the moment the relay is back - the language server did, within the
+        // first second - and until this has run the fallback route has to guess
+        // its upstream from a DNS race, which is how one carried connection sat
+        // for 30 s on a provider that was handshaking in fourteen.
+        if since_upstream >= UPSTREAM_EVERY {
+            proxy::refresh_upstream(egress);
+            since_upstream = Duration::ZERO;
+        }
+        resolvers::warm(dns::core_namespaces(), egress);
+        thread::sleep(WARM_EVERY);
+        since_upstream += WARM_EVERY;
+    }
+}
+
 /// Runs until killed. Never returns `Ok` - the only way out is a bind failure,
 /// which is worth reporting because it means something else holds the address.
 pub fn run() -> Result<(), String> {
@@ -172,6 +290,20 @@ pub fn run() -> Result<(), String> {
     // direct resolvers - and then caches that unsubstituted answer for its full
     // TTL, so one slow startup is felt for minutes.
     log(&format!("egress: if{}", isp_interface()));
+    record_version();
+    thread::spawn(warm_forever);
+
+    // The fallback route lives in this process because it needs the same two
+    // things the relay already has: the ISP interface, and the resolver pool
+    // that knows which provider is substituting right now. It only ever carries
+    // traffic that is actually pointed at it, so starting it here costs a
+    // listening socket and nothing else.
+    let egress = isp_interface();
+    thread::spawn(move || {
+        if let Err(e) = proxy::run(egress) {
+            log_proxy(&format!("not started: {}", e));
+        }
+    });
 
     let mut buf = [0u8; 4096];
     loop {
@@ -216,6 +348,26 @@ pub fn run() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// Everything the version check does hangs off this: a relay that predates
+    /// versioning leaves no file, and it must read as older than this build
+    /// rather than as "no relay" or as a parse error nobody handles.
+    #[test]
+    fn an_unreadable_version_is_the_oldest_one() {
+        assert_eq!(parse_version(None), 0);
+        assert_eq!(parse_version(Some("")), 0);
+        assert_eq!(parse_version(Some("не число")), 0);
+        assert_eq!(parse_version(Some(" 7 \r\n")), 7);
+        assert!(parse_version(None) < RELAY_VERSION);
+    }
+
+    /// The warm loop only exists to beat the ~1 s Windows waits before asking
+    /// the next NRPT nameserver, so it has to refresh well inside the window the
+    /// answer cache serves from.
+    #[test]
+    fn warming_runs_more_often_than_an_answer_goes_stale() {
+        assert!(WARM_EVERY < resolvers::ANSWER_TTL);
+    }
 
     #[test]
     fn the_listener_address_is_loopback() {

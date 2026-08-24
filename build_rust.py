@@ -161,11 +161,18 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.9.1.3"
+    VERSION = "2.9.1_20"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
-    cargo_version = ".".join(version.split(".")[:3])
+    #
+    # The build number is separated by "_" so it can never be mistaken for a
+    # fourth semver component: "2.9.1_14" splits to "2.9.1" here, whereas
+    # "2.9.1.14" put through the old ".".join(...[:3]) would have been fine but
+    # any future edit to this line could silently write a 4-part version into
+    # Cargo.toml - and a changed Cargo version re-salts and invalidates every
+    # licence key that has ever been issued. Both spellings are accepted.
+    cargo_version = ".".join(version.split("_")[0].split(".")[:3])
     print(f"[INFO] Build version: {version}")
 
     # `.secrets.json` is now purely an owner marker: when present, this machine

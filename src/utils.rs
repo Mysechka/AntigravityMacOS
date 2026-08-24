@@ -110,6 +110,24 @@ pub fn mask_path(path: &str) -> String {
     result
 }
 
+/// A path short enough to sit in a progress line: the last few components,
+/// with anything above them elided.
+///
+/// `mask_path` replaces the profile directories with their variable names, which
+/// keeps a log honest but still runs long. This is for the screen, where the
+/// only question is "which of my installs is this".
+pub fn short_path(path: &str) -> String {
+    // Written as a code point so no tool that rewrites escapes can turn one
+    // separator into two, or none.
+    const SEP: char = '\u{5C}';
+    let parts: Vec<&str> = path.split(SEP).filter(|p| !p.is_empty()).collect();
+    if parts.len() <= 3 {
+        return path.to_string();
+    }
+    let sep = SEP.to_string();
+    format!("...{}{}", sep, parts[parts.len() - 3..].join(&sep))
+}
+
 #[cfg(target_os = "windows")]
 pub fn is_admin() -> bool {
     #[link(name = "shell32")]

@@ -207,6 +207,85 @@ pub fn remove_cli() -> Result<(), String> {
     Ok(())
 }
 
+/// Variables that point a Go client at the local fallback proxy.
+///
+/// `HTTPS_PROXY` is what `net/http` reads, and the language server is a Go
+/// program - which is the whole reason no binary patch is needed to route it.
+pub const PROXY_ENV_VAR: &str = "HTTPS_PROXY";
+pub const NO_PROXY_ENV_VAR: &str = "NO_PROXY";
+/// Node keeps its own bundled trust store and does not read the Windows one, so
+/// installing the CA as a system root is not enough: Antigravity's extension
+/// host is Node, it calls the gate host itself, and it answered `self signed
+/// certificate in certificate chain` until this was set. Points at the same
+/// per-machine CA that is already in the user's root store, so it widens nothing
+/// that was not already trusted.
+pub const NODE_CA_ENV_VAR: &str = "NODE_EXTRA_CA_CERTS";
+/// Loopback never goes through the proxy: the language server serves its own
+/// gRPC on 127.0.0.1 and talks to the extension host there.
+const NO_PROXY_VALUE: &str = "127.0.0.1,localhost,::1";
+
+/// Routes this user's Go clients through the local proxy.
+///
+/// Set for the whole user rather than one process because the language server is
+/// launched by the IDE, not by us - there is no parent to inject an environment
+/// into. That breadth is the cost of the design, and the reason the proxy
+/// tunnels everything it does not carry straight through instead of failing:
+/// anything else on the machine that picks the variable up keeps working.
+pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
+    if current_env(PROXY_ENV_VAR).as_deref() == Some(url) {
+        return Ok(Outcome::AlreadySet);
+    }
+    set_env(PROXY_ENV_VAR, Some(url))?;
+    set_env(NO_PROXY_ENV_VAR, Some(NO_PROXY_VALUE))?;
+    set_env(NODE_CA_ENV_VAR, Some(ca_path))?;
+    Ok(Outcome::Applied)
+}
+
+/// Removes them, but only while they still hold what we wrote - a user may have
+/// a proxy of their own, and taking that away would be worse than any bug here.
+pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
+    if current_env(PROXY_ENV_VAR).as_deref() != Some(url) {
+        return Ok(());
+    }
+    set_env(PROXY_ENV_VAR, None)?;
+    if current_env(NO_PROXY_ENV_VAR).as_deref() == Some(NO_PROXY_VALUE) {
+        set_env(NO_PROXY_ENV_VAR, None)?;
+    }
+    // Leaving this behind would keep every Node process on the machine trusting
+    // a CA whose key the revert just deleted - harmless today, and exactly the
+    // kind of leftover that is impossible to explain a year from now.
+    if current_env(NODE_CA_ENV_VAR).as_deref() == Some(ca_path) {
+        set_env(NODE_CA_ENV_VAR, None)?;
+    }
+    Ok(())
+}
+
+pub fn proxy_is_applied(url: &str) -> bool {
+    current_env(PROXY_ENV_VAR).as_deref() == Some(url)
+}
+
+fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
+    let literal = match value {
+        Some(v) => format!("'{}'", v),
+        None => "$null".to_string(),
+    };
+    let script = format!(
+        "[Environment]::SetEnvironmentVariable('{}',{},'User')",
+        name, literal
+    );
+    powershell(&script).ok_or_else(|| format!("не удалось записать {}", name))?;
+    Ok(())
+}
+
+fn current_env(name: &str) -> Option<String> {
+    let out = powershell(&format!(
+        "[Environment]::GetEnvironmentVariable('{}','User')",
+        name
+    ))?;
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 fn current_cli_endpoint() -> Option<String> {
     let out = powershell(&format!(
         "[Environment]::GetEnvironmentVariable('{}','User')",
