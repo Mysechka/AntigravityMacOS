@@ -67,9 +67,10 @@ pub const LISTEN_PORT: u16 = 53;
 /// 12 = the fallback route picks its upstream by measured handshake latency.
 /// 13 = the byte pump is non-blocking, so it stops adding its own latency.
 /// 14-16 = no separate entries were kept for these.
-/// 17 = the proxy is a CONNECT tunnel plus the cert-free relay route only: no
-///     CA, no TLS termination, and no upstream-measuring pass in the warm loop.
-pub const RELAY_VERSION: u32 = 17;
+/// 17 = the proxy carries the gate hosts through the cert-free relay route.
+/// 18 = the TLS-terminating carrier route is gone with its CA, and the warm loop
+///     no longer measures upstreams (there is one relay, nothing to choose).
+pub const RELAY_VERSION: u32 = 18;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
