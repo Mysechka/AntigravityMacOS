@@ -72,7 +72,9 @@ pub const LISTEN_PORT: u16 = 53;
 ///     no longer measures upstreams (there is one relay, nothing to choose).
 /// 19 = idle relayed tunnels are closed before they go stale, the relay is
 ///     benched when it stops carrying, teardown is logged and lines are stamped.
-pub const RELAY_VERSION: u32 = 19;
+/// 20 = a relay that cuts tunnels at the handshake counts as failing (bytes
+///     moved, so "carried nothing" missed it), and the bench backs off.
+pub const RELAY_VERSION: u32 = 20;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
