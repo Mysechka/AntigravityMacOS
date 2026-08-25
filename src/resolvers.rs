@@ -218,15 +218,6 @@ const LIVENESS_BUDGET: Duration = Duration::from_millis(500);
 /// three proxies to one, which is the opposite of the redundancy this is for.
 /// Off the client's path there is no reason to be mean about it.
 const LIVENESS_BUDGET_WARM: Duration = Duration::from_millis(2500);
-/// Budget for the *handshake*, not just the connection.
-///
-/// TCP says almost nothing about these proxies. Measured on one machine within a
-/// minute: geohide's `45.155.204.190` accepted TCP in 34 ms and then took
-/// **10527 ms** to finish the TLS handshake, while xbox's proxy did the same
-/// handshake in 249 ms and Google direct in 91 ms. A TCP-only probe calls all of
-/// them alive, and the client pays the difference on its first request - which
-/// is exactly the "the model answers slowly" the user sees.
-const HANDSHAKE_BUDGET: Duration = Duration::from_millis(3000);
 /// How long "this address answered" is believed.
 ///
 /// Was ten minutes, on the assumption that a working proxy keeps working. It
@@ -398,7 +389,8 @@ fn remember_liveness(addr: IpAddr, alive: bool) {
 /// With no `sni` - the client path, where the cache normally answers and a
 /// handshake is far too expensive - it falls back to the connection alone.
 fn reachable(addr: IpAddr, budget: Duration, sni: Option<&str>) -> bool {
-    let Ok(sock) = std::net::TcpStream::connect_timeout(&SocketAddr::new(addr, LIVENESS_PORT), budget)
+    let Ok(sock) =
+        std::net::TcpStream::connect_timeout(&SocketAddr::new(addr, LIVENESS_PORT), budget)
     else {
         return false;
     };
@@ -979,7 +971,8 @@ fn resolve_upstream(
     // same names every 15 s, and two of the four never substitute by design, so
     // logging its races would fill the 64 KB budget in about an hour and take
     // the diagnostics with it.
-    if from_client && !replies.is_empty() && !dns_client::answer_addrs(&replies[best].1).is_empty() {
+    if from_client && !replies.is_empty() && !dns_client::answer_addrs(&replies[best].1).is_empty()
+    {
         let heard: Vec<&str> = replies.iter().map(|(i, _)| PROVIDERS[*i].name).collect();
         crate::dns_forwarder::log_race(&key.0, &heard, got_reference);
     }
@@ -1033,65 +1026,66 @@ fn prefer_substituted(
     cached_answer(query, true, from_client).or(Some(fresh))
 }
 
-/// One address per provider that currently **substitutes** `name`, measured now.
+/// Seeds each provider's proxy-address set from a control name, sequentially.
 ///
-/// This is what the NRPT fallback list must be built from. A provider that
-/// returns the genuine Google address for a name has no business being a
-/// fallback resolver for it: the moment the relay is a little slow (a cold
-/// start is ~170 ms), Windows takes that fast genuine answer instead and caches
-/// it for its full TTL, so the region error comes back intermittently for
-/// minutes. Measured on a real machine: xbox-dns in `daily-cloudcode-pa`'s
-/// fallback list handed out 172.217/16 on roughly one query in eight.
-///
-/// Probed sequentially - a handful of queries at rule-setup time, not on the
-/// hot path - and bound to `if_index` so a tunnel does not make every provider
-/// look like a passthrough.
-/// Every proxy address that any provider substitutes `name` with, tagged with
-/// which provider offered it.
-///
-/// `substituting_addrs` answers "whose *resolver* should an NRPT rule list";
-/// this answers "which *proxies* could actually carry this traffic", which is a
-/// different question and the one the fallback route has to ask. It matters
-/// because the providers are not interchangeable in speed: measured within one
-/// hour, xbox's proxy completed the TLS handshake in 249 ms and geohide's in
-/// 10527 ms, so picking whichever won a DNS race is picking at random among a
-/// 40x spread.
-pub fn substituted_addrs(name: &str, if_index: u32) -> Vec<(&'static str, Vec<Ipv4Addr>)> {
-    let query = dns_client::build_query(name, 0x6768);
-
-    let mut reference: Vec<IpAddr> = Vec::new();
-    for server in REFERENCE_V4 {
-        if let Ok(ip) = server.parse::<Ipv4Addr>() {
-            if let Ok(reply) = dns_client::query_raw_via(&query, ip, if_index, QUERY_TIMEOUT) {
-                reference.extend(dns_client::answer_addrs(&reply));
+/// `substituting_addrs` runs in the menu process at rule-setup time, which has
+/// its own (cold) `PROXY_SET` - the relay's warm loop that normally learns it
+/// lives in a different process. Without this the set is empty, and `classify`
+/// falls back to its bootstrap rule (`proxy.is_empty()` -> `Substituted`), which
+/// flags a genuine answer that merely landed on a different Google /16 (D7).
+/// That is exactly how xbox-dns, which returns genuine for `daily-cloudcode-pa`,
+/// ended up written into that name's NRPT fallback - the I22 leak. Learning the
+/// sets first makes `classify` take the proxy-match path, so a genuine
+/// different-/16 answer is `Sibling`, not `Substituted`.
+fn ensure_proxy_sets_learned(if_index: u32) {
+    if !(0..PROVIDERS.len()).any(proxy_addrs_are_stale) {
+        return;
+    }
+    // Union across two usable control names, not one: geohide rotates its proxy
+    // across three addresses in three /16s (see PROXY_SET_TTL), so a single probe
+    // can miss the /16 it later answers `daily-cloudcode-pa` from - which would
+    // drop its sole substituter and fall the rule back to every provider (the I22
+    // leak). `learn_proxy_addrs` unions, so a second name closes most of that gap
+    // without paying for all five.
+    const ROUNDS: usize = 2;
+    let mut done = 0;
+    for &picked in CONTROL_NAMES {
+        if done >= ROUNDS {
+            break;
+        }
+        let control = dns_client::build_query(picked, 0x0C71);
+        let mut cref: Vec<IpAddr> = Vec::new();
+        for server in REFERENCE_V4 {
+            if let Ok(ip) = server.parse::<Ipv4Addr>() {
+                if let Ok(reply) = dns_client::query_raw_via(&control, ip, if_index, QUERY_TIMEOUT)
+                {
+                    cref.extend(dns_client::answer_addrs(&reply));
+                }
             }
         }
-    }
-
-    let mut out = Vec::new();
-    for (idx, provider) in PROVIDERS.iter().enumerate() {
-        let Some(reply) = ask_provider(provider, &query, if_index, QUERY_TIMEOUT) else {
-            continue;
-        };
-        let addrs = dns_client::answer_addrs(&reply);
-        if classify(&addrs, &reference, &known_proxy_addrs(idx)) != Verdict::Substituted {
+        // A control name the ISP link's DPI stubs (e.g. chatgpt.com) yields no
+        // usable reference - classify filters those stubs - so try the next.
+        let usable = cref.iter().any(|a| match a {
+            IpAddr::V4(v) => !REFERENCE_STUBS.contains(v),
+            IpAddr::V6(_) => true,
+        });
+        if !usable {
             continue;
         }
-        let v4: Vec<Ipv4Addr> = addrs
-            .into_iter()
-            .filter_map(|a| match a {
-                IpAddr::V4(v) => Some(v),
-                IpAddr::V6(_) => None,
-            })
-            .collect();
-        if !v4.is_empty() {
-            out.push((provider.name, v4));
+        for idx in 0..PROVIDERS.len() {
+            if let Some(reply) = ask_provider(&PROVIDERS[idx], &control, if_index, QUERY_TIMEOUT) {
+                let addrs = dns_client::answer_addrs(&reply);
+                if classify(&addrs, &cref, &[]) == Verdict::Substituted {
+                    learn_proxy_addrs(idx, addrs);
+                }
+            }
         }
+        done += 1;
     }
-    out
 }
 
 pub fn substituting_addrs(name: &str, if_index: u32) -> Vec<&'static str> {
+    ensure_proxy_sets_learned(if_index);
     let query = dns_client::build_query(name, 0x6767);
 
     let mut reference: Vec<IpAddr> = Vec::new();
@@ -1109,7 +1103,13 @@ pub fn substituting_addrs(name: &str, if_index: u32) -> Vec<&'static str> {
             continue;
         };
         let addrs = dns_client::answer_addrs(&reply);
-        if classify(&addrs, &reference, &known_proxy_addrs(idx)) == Verdict::Substituted {
+        let known = known_proxy_addrs(idx);
+        // Only a substitution backed by a *known* proxy address is written into
+        // an NRPT fallback. classify's empty-set bootstrap exists to learn
+        // control names, not to build rules: trusting it here would flag genuine
+        // Google on a different /16 and re-open the I22 leak (see
+        // `ensure_proxy_sets_learned`).
+        if !known.is_empty() && classify(&addrs, &reference, &known) == Verdict::Substituted {
             if let Some(first) = provider.v4.first() {
                 out.push(*first);
             }

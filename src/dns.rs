@@ -26,12 +26,16 @@ const AG_NRPT_TAG: &str = "AG_UNLOCKER_NRPT_V2";
 // stale (and much broader) rules behind.
 const AG_NRPT_LEGACY_TAGS: &[&str] = &["AG_UNLOCKER_NRPT"];
 
-// Endpoints used by language_server.exe / agy.exe and the Electron shell.
+// The only names that actually need unblock DNS, measured end-to-end:
+// `daily-cloudcode-pa` is the sole region-gated endpoint for the IDE (geohide
+// substitutes it; it carries the whole agentic flow), and `generativelanguage`
+// is kept for the Gemini CLI path. `cloudcode-pa` and `antigravity-unleash` were
+// dropped: nobody substitutes them (genuine everywhere), so a rule only leaked
+// DNS to a third party for zero benefit (N2). Everything else Antigravity talks
+// to - oauth2/www/play/accounts/jetski-webchannel - works on real Google.
 const AG_NRPT_CORE: &[&str] = &[
-    "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
     "generativelanguage.googleapis.com",
-    "antigravity-unleash.goog",
 ];
 // Only needed for the Gemini CLI flow (the API-key page must open in a browser).
 const AG_NRPT_GEMINI: &[&str] = &["aistudio.google.com"];
@@ -542,32 +546,32 @@ mod tests {
 
     #[test]
     fn a_foreign_rule_on_one_of_our_names_is_a_conflict() {
-        let out = "cloudcode-pa.googleapis.com|NOVA_DNS_UNBLOCK\n\
+        let out = "daily-cloudcode-pa.googleapis.com|NOVA_DNS_UNBLOCK\n\
                    chatgpt.com|NOVA_DNS_UNBLOCK\n";
         assert_eq!(
             parse_conflicts(out, AG_NRPT_CORE),
-            vec!["cloudcode-pa.googleapis.com (NOVA_DNS_UNBLOCK)"]
+            vec!["daily-cloudcode-pa.googleapis.com (NOVA_DNS_UNBLOCK)"]
         );
     }
 
     /// Windows writes names with a trailing dot; that is the same name.
     #[test]
     fn a_trailing_dot_still_matches() {
-        let found = parse_conflicts("antigravity-unleash.goog.|OTHER\n", AG_NRPT_CORE);
-        assert_eq!(found, vec!["antigravity-unleash.goog (OTHER)"]);
+        let found = parse_conflicts("generativelanguage.googleapis.com.|OTHER\n", AG_NRPT_CORE);
+        assert_eq!(found, vec!["generativelanguage.googleapis.com (OTHER)"]);
     }
 
     /// A leading dot is a subtree rule, which our exact-name rule already
     /// outranks - claiming it would cost another tool its subdomains for free.
     #[test]
     fn a_subtree_rule_is_left_alone() {
-        let out = ".cloudcode-pa.googleapis.com|OTHER\n.googleapis.com|OTHER\n";
+        let out = ".daily-cloudcode-pa.googleapis.com|OTHER\n.googleapis.com|OTHER\n";
         assert!(parse_conflicts(out, AG_NRPT_CORE).is_empty());
     }
 
     #[test]
     fn the_same_collision_is_reported_once() {
-        let out = "cloudcode-pa.googleapis.com|X\nCLOUDCODE-PA.GOOGLEAPIS.COM|X\n";
+        let out = "daily-cloudcode-pa.googleapis.com|X\nDAILY-CLOUDCODE-PA.GOOGLEAPIS.COM|X\n";
         assert_eq!(parse_conflicts(out, AG_NRPT_CORE).len(), 1);
     }
 

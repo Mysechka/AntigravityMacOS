@@ -62,6 +62,54 @@ fn main() {
         release_token, version
     );
 
+    // The fast relay route's whole method lives in the gitignored `src/relay.rs`
+    // and is compiled in only when it AND the credential file are present (owner
+    // build) - the `relay` cfg. A public clone lacks both, builds under
+    // `cfg(not(relay))`, and runs the DNS route. The credential is AES-256-GCM
+    // encrypted here with a random per-build key; neither the key nor the method
+    // is in any committed source. This is not un-reversible (agy's AES-GCM vault
+    // was reversed, and so can an official binary): it keeps the method off the
+    // public repo and off a `strings` dump of the packed binary.
+    println!("cargo::rustc-check-cfg=cfg(relay)");
+    println!("cargo:rerun-if-changed=.relay_key");
+    println!("cargo:rerun-if-changed=src/relay.rs");
+    if Path::new("src/relay.rs").exists() && Path::new(".relay_key").exists() {
+        println!("cargo:rustc-cfg=relay");
+        let cred = fs::read_to_string(".relay_key")
+            .expect("read .relay_key")
+            .trim()
+            .to_string();
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut key).expect("random key");
+        getrandom::getrandom(&mut nonce).expect("random nonce");
+        let ct = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key))
+            .encrypt(Nonce::from_slice(&nonce), cred.as_bytes())
+            .expect("encrypt relay credential");
+        let bytes = |b: &[u8]| {
+            b.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let relay_out =
+            Path::new(&env::var("OUT_DIR").expect("OUT_DIR unset")).join("relay_gen.rs");
+        fs::write(
+            &relay_out,
+            format!(
+                "pub const RELAY_KEY: [u8; 32] = [{}];\n\
+                 pub const RELAY_NONCE: [u8; 12] = [{}];\n\
+                 pub const RELAY_CT: &[u8] = &[{}];\n",
+                bytes(&key),
+                bytes(&nonce),
+                bytes(&ct)
+            ),
+        )
+        .expect("failed to write relay_gen.rs");
+    }
+
     if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
         let mut res = winres::WindowsResource::new();
         res.set_icon("icon.ico");

@@ -66,7 +66,10 @@ pub const LISTEN_PORT: u16 = 53;
 /// 11 = liveness is measured by the TLS handshake, not just the connection.
 /// 12 = the fallback route picks its upstream by measured handshake latency.
 /// 13 = the byte pump is non-blocking, so it stops adding its own latency.
-pub const RELAY_VERSION: u32 = 16;
+/// 14-16 = no separate entries were kept for these.
+/// 17 = the proxy is a CONNECT tunnel plus the cert-free relay route only: no
+///     CA, no TLS termination, and no upstream-measuring pass in the warm loop.
+pub const RELAY_VERSION: u32 = 17;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -249,8 +252,6 @@ fn relay(query: &[u8]) -> Option<(Vec<u8>, &'static str, resolvers::Verdict)> {
 /// answer cache will serve it from and a client query never finds it expired.
 /// Cheap: four names, one upstream query each, once every quarter minute.
 const WARM_EVERY: Duration = Duration::from_secs(15);
-/// How often the fallback route re-measures which proxy is quickest.
-const UPSTREAM_EVERY: Duration = Duration::from_secs(3 * 60);
 
 /// Keeps a vetted answer ready for every routed name, forever.
 ///
@@ -261,21 +262,10 @@ const UPSTREAM_EVERY: Duration = Duration::from_secs(3 * 60);
 /// that goes quiet costs the whole timeout), and it does not have to: doing the
 /// work on a timer instead means the client's query is answered from memory.
 fn warm_forever() {
-    let mut since_upstream = UPSTREAM_EVERY;
     loop {
         let egress = isp_interface();
-        // Measured before the names are warmed, not after. A client reconnects
-        // the moment the relay is back - the language server did, within the
-        // first second - and until this has run the fallback route has to guess
-        // its upstream from a DNS race, which is how one carried connection sat
-        // for 30 s on a provider that was handshaking in fourteen.
-        if since_upstream >= UPSTREAM_EVERY {
-            proxy::refresh_upstream(egress);
-            since_upstream = Duration::ZERO;
-        }
         resolvers::warm(dns::core_namespaces(), egress);
         thread::sleep(WARM_EVERY);
-        since_upstream += WARM_EVERY;
     }
 }
 

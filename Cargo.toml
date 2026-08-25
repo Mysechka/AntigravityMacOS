@@ -13,14 +13,19 @@ regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
 webpki-roots = "1"
+# Decrypts the relay credential baked in by build.rs (owner build only; the
+# private src/relay.rs is the only user).
+aes-gcm = "0.10"
 
 [build-dependencies]
 winres = "0.1"
 # build.rs derives the per-release canary with the same formula as canary.rs.
 sha2 = "0.10"
 hex = "0.4"
+# Encrypt the relay credential into the binary with a random per-build key.
+aes-gcm = "0.10"
+getrandom = "0.2"
 
 [profile.release]
 opt-level = "z"

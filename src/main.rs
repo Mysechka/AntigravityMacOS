@@ -314,7 +314,10 @@ fn process_install(install: &Path) -> Result<String, String> {
                 "  [OK] Эндпоинт CloudCode переключён ({} — нужен новый терминал)",
                 endpoint::CLI_ENV_VAR
             ),
-            Err(e) => println!("  \x1b[33m[WARN] Эндпоинт не переключён: {}\x1b[0m\x1b[92m", e),
+            Err(e) => println!(
+                "  \x1b[33m[WARN] Эндпоинт не переключён: {}\x1b[0m\x1b[92m",
+                e
+            ),
         }
         return Ok("Antigravity CLI".to_string());
     }
@@ -416,66 +419,27 @@ fn disable_fallback_proxy() {
     println!("готово.");
 }
 
-/// Menu 8: the traffic-level route, for names no resolver substitutes.
-fn handle_fallback_proxy() {
-    clear_screen();
-    println!("{}", APP_TITLE);
-    println!();
-
-    let url = proxy::proxy_url();
-    if endpoint::proxy_is_applied(&url) || proxy::ca_is_trusted() {
-        disable_fallback_proxy();
-        thread::sleep(Duration::from_secs(2));
+/// Takes out the certificate authority a build up to 2.9.1_27 installed.
+///
+/// That route is gone - the relay reaches the same backends with no CA at all -
+/// but an upgrade goes through neither undo path, and `apply_proxy` returns
+/// early on a machine whose `HTTPS_PROXY` already points here. Without this,
+/// upgrading leaves a trusted root and its private key sitting in
+/// `%LOCALAPPDATA%` for a route nothing uses any more.
+///
+/// Gated on the certificate file rather than on `ca_is_trusted()`, which costs a
+/// PowerShell call: every machine that has the root also still has the file, and
+/// the file-deleted-by-hand case is still covered by menu 6 and menu 7.
+fn remove_legacy_ca() {
+    let cert = proxy::ca_cert_path();
+    if !cert.exists() {
         return;
     }
-
-    println!("Резервный маршрут: трафик Antigravity к *.googleapis.com пойдёт");
-    println!("через локальный прокси на {}.", url);
-    println!();
-    println!("Это нужно для хостов, которые не подменяет ни один резолвер —");
-    println!("например jetski-webchannel.googleapis.com, через который идёт");
-    println!("поток планировщика. DNS их закрыть не может.");
-    println!();
-    println!("\x1b[33mЧто будет установлено: корневой сертификат, созданный");
-    println!("на этой машине (в хранилище текущего пользователя). Прокси");
-    println!("расшифровывает только *.googleapis.com; вход в аккаунт и всё");
-    println!("остальное идёт сквозным туннелем и не вскрывается.");
-    println!("Пункт 8 ещё раз — выключить и удалить сертификат.\x1b[0m\x1b[92m");
-    println!();
-
-    if !prompt("Включить? (y/N): ").eq_ignore_ascii_case("y") {
-        return;
-    }
-
-    print!("Установка сертификата... ");
+    print!("Удаление сертификата старого запасного пути... ");
     io::stdout().flush().ok();
-    match proxy::trust_ca() {
-        Ok(_) => println!("готово."),
-        Err(e) => {
-            println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e);
-            thread::sleep(Duration::from_secs(3));
-            return;
-        }
-    }
-
-    print!("Направление трафика в прокси... ");
-    io::stdout().flush().ok();
-    match endpoint::apply_proxy(&url, &proxy::ca_cert_path().to_string_lossy()) {
-        Ok(_) => println!("готово."),
-        Err(e) => {
-            println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e);
-            // Never leave a trusted certificate behind for a route that is not
-            // switched on: it would be pure exposure for zero benefit.
-            proxy::untrust_ca();
-            thread::sleep(Duration::from_secs(3));
-            return;
-        }
-    }
-
-    println!();
-    println!("Готово. Перезапустите Antigravity — переменные среды читаются");
-    println!("при старте процесса.");
-    thread::sleep(Duration::from_secs(4));
+    endpoint::clear_node_ca(&cert.to_string_lossy()).ok();
+    proxy::untrust_ca();
+    println!("готово.");
 }
 
 /// Full revert: undoes the binary patch, puts app.asar back and drops the DNS
@@ -679,7 +643,7 @@ fn handle_patch_antigravity() {
     let installs = find_all_installs();
 
     if installs.is_empty() {
-        println!("{}", "Ð£ÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸ Antigravity Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½Ñ.");
+        println!("{}", "Установки Antigravity не найдены.");
         thread::sleep(Duration::from_secs(2));
         return;
     }
@@ -706,17 +670,36 @@ fn handle_patch_antigravity() {
                 successes.push(name);
             }
             Err(e) => {
-                println!("\x1b[33mÐ¾ÑÐ¸Ð±ÐºÐ°\x1b[0m\x1b[92m");
+                println!("\x1b[33mошибка\x1b[0m\x1b[92m");
                 failures.push(format!("{} - {}", mask_path(&path), e));
             }
         }
     }
 
+    // Outside the admin check below: the CA is per-user, `certutil -user` needs
+    // no elevation, and a machine upgrading from the carrier route must not keep
+    // a trusted root just because this run happened not to be elevated.
+    remove_legacy_ca();
+
     if (!successes.is_empty() || !failures.is_empty()) && is_admin() {
         // Unconditionally, not only on a fresh machine: this run has to bring the
         // relay up and re-point the rules at it even when the rules already exist.
         apply_dns_patch(false);
-        offer_fallback_certificate();
+        // Turn the fast relay route on automatically. It needs no certificate
+        // (S19), so there is nothing for the user to weigh - press 1 and use
+        // Antigravity. And it is never a single point of failure: if the relay
+        // fails, the proxy falls straight through to the geohide DNS answer for
+        // `daily-` (the route that was primary before). A keyless clone has no
+        // relay baked in and simply stays on the DNS route.
+        if proxy::relay_available() {
+            let url = proxy::proxy_url();
+            print!("Быстрый маршрут (релей)... ");
+            io::stdout().flush().ok();
+            match endpoint::apply_proxy(&url, "") {
+                Ok(_) => println!("OK"),
+                Err(e) => println!("\x1b[33m{}\x1b[0m\x1b[92m", e),
+            }
+        }
     }
 
     print_results(&successes, &failures);
@@ -736,42 +719,6 @@ fn install_label(install: &Path) -> &'static str {
         "Antigravity IDE"
     } else {
         "Antigravity 2.0"
-    }
-}
-
-/// The one question menu 1 asks. Yellow, because it is the only step that puts
-/// something in the user's certificate store, and that should never slip past
-/// somebody skimming a wall of green.
-fn offer_fallback_certificate() {
-    let url = proxy::proxy_url();
-    if endpoint::proxy_is_applied(&url) {
-        return;
-    }
-    println!();
-    println!("\x1b[33mÐ£ÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ ÑÐµÑÑÐ¸ÑÐ¸ÐºÐ°Ñ Ð´Ð»Ñ Ð·Ð°Ð¿Ð°ÑÐ½Ð¾Ð³Ð¾ Ð¿ÑÑÐ¸?\x1b[0m\x1b[92m");
-    println!("  ÐÐ°Ð¿Ð°ÑÐ½Ð¾Ð¹ Ð¿ÑÑÑ Ð²ÐµÐ´ÑÑ ÑÑÐ°ÑÐ¸Ðº Antigravity ÑÐµÑÐµÐ· ÑÐ°Ð¼ÑÐ¹ Ð±ÑÑÑÑÑÐ¹ Ð¸Ð· Ð¿ÑÐ¾ÐºÑÐ¸,");
-    println!("  ÐºÐ¾Ð³Ð´Ð° ÑÐ¿Ð¾ÑÐ¾Ð± ÑÐµÑÐµÐ· DNS ÑÐ¾ÑÐ¼Ð¾Ð·Ð¸Ñ Ð¸Ð»Ð¸ Ð¿ÐµÑÐµÑÑÐ°ÑÑ ÑÐ°Ð±Ð¾ÑÐ°ÑÑ. Ð¡ÐµÑÑÐ¸ÑÐ¸ÐºÐ°Ñ");
-    println!("  ÑÐ¾Ð·Ð´Ð°ÑÑÑÑ Ð½Ð° ÑÑÐ¾Ð¹ Ð¼Ð°ÑÐ¸Ð½Ðµ, ÑÑÐ°Ð²Ð¸ÑÑÑ ÑÐ¾Ð»ÑÐºÐ¾ Ð´Ð»Ñ Ð²Ð°Ñ Ð¸ ÑÐ½Ð¸Ð¼Ð°ÐµÑÑÑ Ð¿ÑÐ½ÐºÑÐ¾Ð¼ 8.");
-    println!();
-
-    if prompt("  1 â ÑÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ, Enter â Ð¿ÑÐ¾Ð¿ÑÑÑÐ¸ÑÑ: ") != "1" {
-        return;
-    }
-
-    print!("  Ð¡ÐµÑÑÐ¸ÑÐ¸ÐºÐ°Ñ Ð¸ Ð¼Ð°ÑÑÑÑÑ... ");
-    io::stdout().flush().ok();
-    if let Err(e) = proxy::trust_ca() {
-        println!("\x1b[33mÐ¾ÑÐ¸Ð±ÐºÐ°: {}\x1b[0m\x1b[92m", e);
-        return;
-    }
-    match endpoint::apply_proxy(&url, &proxy::ca_cert_path().to_string_lossy()) {
-        Ok(_) => println!("OK â Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÑÐ¸ÑÐµ Antigravity"),
-        Err(e) => {
-            // Never leave a trusted certificate behind for a route that is not
-            // switched on: pure exposure for zero benefit.
-            proxy::untrust_ca();
-            println!("\x1b[33mÐ¾ÑÐ¸Ð±ÐºÐ°: {}\x1b[0m\x1b[92m", e);
-        }
     }
 }
 
@@ -1058,6 +1005,8 @@ fn handle_manual_path() {
         }
     }
 
+    remove_legacy_ca();
+
     if (!successes.is_empty() || !failures.is_empty()) && is_admin() {
         // Unconditionally, not only on a fresh machine: this run has to bring the
         // relay up and re-point the rules at it even when the rules already exist.
@@ -1148,7 +1097,6 @@ fn main() {
         // restore the menu's bright-green afterwards.
         println!("\x1b[38;5;154m6. Отключить DNS-службу и NRPT (отключит исправление ошибок \"400\")\x1b[0m\x1b[92m");
         println!("\x1b[38;5;154m7. Полный откат (снять патч и вернуть исходное состояние)\x1b[0m\x1b[92m");
-        println!("\x1b[38;5;154m8. Удалить сертификат запасного пути\x1b[0m\x1b[92m");
         println!("0. Выход");
         println!();
         println!("Пункты 4 и 5 открывают ссылку в браузере.");
@@ -1180,7 +1128,6 @@ fn main() {
             "5" => open_url(DONATE_URL),
             "6" => handle_restore_dns(),
             "7" => handle_revert_all(),
-            "8" => handle_fallback_proxy(),
             "0" => break,
             _ => {
                 println!("{}", "Неверный выбор.");

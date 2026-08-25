@@ -237,7 +237,11 @@ pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
     }
     set_env(PROXY_ENV_VAR, Some(url))?;
     set_env(NO_PROXY_ENV_VAR, Some(NO_PROXY_VALUE))?;
-    set_env(NODE_CA_ENV_VAR, Some(ca_path))?;
+    // The relay route terminates no TLS and installs no CA, so it needs no
+    // `NODE_EXTRA_CA_CERTS`; only the legacy carrier route passes a real path.
+    if !ca_path.is_empty() {
+        set_env(NODE_CA_ENV_VAR, Some(ca_path))?;
+    }
     Ok(Outcome::Applied)
 }
 
@@ -251,9 +255,20 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
     if current_env(NO_PROXY_ENV_VAR).as_deref() == Some(NO_PROXY_VALUE) {
         set_env(NO_PROXY_ENV_VAR, None)?;
     }
-    // Leaving this behind would keep every Node process on the machine trusting
-    // a CA whose key the revert just deleted - harmless today, and exactly the
-    // kind of leftover that is impossible to explain a year from now.
+    clear_node_ca(ca_path)
+}
+
+/// Drops `NODE_EXTRA_CA_CERTS` if it still holds `ca_path`, leaving a value the
+/// user set themselves alone.
+///
+/// Separate from `remove_proxy` because an *upgrade* has to drop the old CA
+/// without turning the proxy off: a machine coming from the carrier route
+/// (<= 2.9.1_27) already has `HTTPS_PROXY` pointing here, so `apply_proxy`
+/// returns `AlreadySet` and never reaches this. Leaving it behind would keep
+/// every Node process on the machine trusting a CA nothing uses any more -
+/// harmless today, and exactly the kind of leftover that is impossible to
+/// explain a year from now.
+pub fn clear_node_ca(ca_path: &str) -> Result<(), String> {
     if current_env(NODE_CA_ENV_VAR).as_deref() == Some(ca_path) {
         set_env(NODE_CA_ENV_VAR, None)?;
     }
