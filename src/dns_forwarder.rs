@@ -74,7 +74,9 @@ pub const LISTEN_PORT: u16 = 53;
 ///     benched when it stops carrying, teardown is logged and lines are stamped.
 /// 20 = a relay that cuts tunnels at the handshake counts as failing (bytes
 ///     moved, so "carried nothing" missed it), and the bench backs off.
-pub const RELAY_VERSION: u32 = 20;
+/// 21 = the relay leg asks for `cloudcode-pa` instead of `daily-`, which costs
+///     it a second proxy hop: 2.14 s median down to 0.22 s, and no variance.
+pub const RELAY_VERSION: u32 = 21;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
