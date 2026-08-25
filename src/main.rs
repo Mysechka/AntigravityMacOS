@@ -430,9 +430,24 @@ fn disable_fallback_proxy() {
 /// Gated on the certificate file rather than on `ca_is_trusted()`, which costs a
 /// PowerShell call: every machine that has the root also still has the file, and
 /// the file-deleted-by-hand case is still covered by menu 6 and menu 7.
+///
+/// **Must run only once the installed relay is this build, and never before.**
+/// An out-of-date relay is by definition one that still terminates TLS, signs
+/// with this CA, and - the part that makes it dangerous - *regenerates* one the
+/// moment the file disappears. Pulling the root out from under a relay that is
+/// still running therefore does not disable the old route, it makes it present a
+/// certificate nothing trusts: every gate request then dies as `BadCertificate`,
+/// which the language server reports as "An existing connection was forcibly
+/// closed by the remote host". That is exactly what shipping this call before
+/// `apply_dns_patch` did to users whose relay update did not go through - most
+/// obviously anyone running without administrator rights, where the relay is
+/// never replaced at all.
 fn remove_legacy_ca() {
     let cert = proxy::ca_cert_path();
     if !cert.exists() {
+        return;
+    }
+    if background::relay_is_outdated() {
         return;
     }
     print!("Удаление сертификата старого запасного пути... ");
@@ -676,11 +691,6 @@ fn handle_patch_antigravity() {
         }
     }
 
-    // Outside the admin check below: the CA is per-user, `certutil -user` needs
-    // no elevation, and a machine upgrading from the carrier route must not keep
-    // a trusted root just because this run happened not to be elevated.
-    remove_legacy_ca();
-
     if (!successes.is_empty() || !failures.is_empty()) && is_admin() {
         // Unconditionally, not only on a fresh machine: this run has to bring the
         // relay up and re-point the rules at it even when the rules already exist.
@@ -701,6 +711,10 @@ fn handle_patch_antigravity() {
             }
         }
     }
+
+    // Last, and never earlier: the CA may only go once the relay that signs with
+    // it has actually been replaced. See `remove_legacy_ca`.
+    remove_legacy_ca();
 
     print_results(&successes, &failures);
 }
@@ -1005,13 +1019,13 @@ fn handle_manual_path() {
         }
     }
 
-    remove_legacy_ca();
-
     if (!successes.is_empty() || !failures.is_empty()) && is_admin() {
         // Unconditionally, not only on a fresh machine: this run has to bring the
         // relay up and re-point the rules at it even when the rules already exist.
         apply_dns_patch(false);
     }
+
+    remove_legacy_ca();
 
     print_results(&successes, &failures);
 }

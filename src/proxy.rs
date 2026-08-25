@@ -76,9 +76,6 @@ pub fn relay_available() -> bool {
 const PUMP_MIN_SLEEP: Duration = Duration::from_millis(1);
 #[cfg_attr(not(relay), allow(dead_code))]
 const PUMP_MAX_SLEEP: Duration = Duration::from_millis(50);
-/// How long a connection may sit with neither side saying anything.
-#[cfg_attr(not(relay), allow(dead_code))]
-const IDLE_LIMIT: Duration = Duration::from_secs(90);
 /// How long a freshly accepted socket may stay silent before it is dropped.
 /// Long, because a pooling client legitimately opens sockets before it has
 /// anything to send; bounded, so an abandoned one does not hold a thread.
@@ -255,6 +252,13 @@ fn tunnel(mut client: TcpStream, host: &str, port: u16) {
     // here even though the intercepted path cannot use it.
     let up = thread::spawn(move || io::copy(&mut client, &mut upstream_w));
     io::copy(&mut upstream, &mut client_w).ok();
+    // FIN first, and only then the full shutdown that releases the thread still
+    // reading from this socket. Going straight to `Both` closes it with whatever
+    // the client had already sent still unread, and Windows answers unread bytes
+    // with RST - which a pooling client reports as "An existing connection was
+    // forcibly closed by the remote host" instead of quietly reconnecting.
+    client_w.shutdown(std::net::Shutdown::Write).ok();
+    thread::sleep(PUMP_MAX_SLEEP);
     client_w.shutdown(std::net::Shutdown::Both).ok();
     up.join().ok();
 }

@@ -70,7 +70,9 @@ pub const LISTEN_PORT: u16 = 53;
 /// 17 = the proxy carries the gate hosts through the cert-free relay route.
 /// 18 = the TLS-terminating carrier route is gone with its CA, and the warm loop
 ///     no longer measures upstreams (there is one relay, nothing to choose).
-pub const RELAY_VERSION: u32 = 18;
+/// 19 = idle relayed tunnels are closed before they go stale, the relay is
+///     benched when it stops carrying, teardown is logged and lines are stamped.
+pub const RELAY_VERSION: u32 = 19;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -159,9 +161,46 @@ fn parse_version(raw: Option<&str>) -> u32 {
     raw.and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
+/// Local wall-clock `HH:MM:SS` for a log line.
+///
+/// Local, not UTC: the only reader is a user comparing the log against the moment
+/// their editor showed an error, and asking them to do timezone arithmetic on a
+/// bug report is how a report becomes useless. `GetLocalTime` rather than a date
+/// crate because this is the only place the crate would be used.
+#[cfg(target_os = "windows")]
+fn stamp() -> String {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    extern "system" {
+        fn GetLocalTime(out: *mut SystemTime);
+    }
+    let mut t = SystemTime::default();
+    unsafe { GetLocalTime(&mut t) };
+    format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stamp() -> String {
+    String::new()
+}
+
 /// Best-effort logging: a background process with no console is otherwise
 /// impossible to diagnose. Truncated rather than rotated - nothing here is
 /// worth keeping across sessions.
+///
+/// Every line is stamped. Without it a log says what happened but never *when*,
+/// so a torn connection cannot be lined up against the error the user saw - which
+/// is precisely the question a bug report asks.
 fn log(line: &str) {
     let path = log_path();
     if let Some(dir) = path.parent() {
@@ -171,7 +210,7 @@ fn log(line: &str) {
         fs::remove_file(&path).ok();
     }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        writeln!(f, "{}", line).ok();
+        writeln!(f, "{} {}", stamp(), line).ok();
     }
 }
 
