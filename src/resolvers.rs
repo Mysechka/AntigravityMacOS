@@ -1486,16 +1486,31 @@ mod tests {
         b
     }
 
-    /// Nothing else may be in the cache while a test reads it back.
-    fn clear_answers() {
+    /// Serialises every test that shares the process-wide answer cache.
+    ///
+    /// This used to be a bare call, and cargo runs tests in parallel threads of
+    /// one process: two of them would each wipe the map the other had just
+    /// written, and whichever asserted second failed. Roughly one run in ten, and
+    /// it read exactly like a product bug. Holding the guard for the length of a
+    /// test is what makes "nothing else may be in the cache" true rather than
+    /// merely intended.
+    static CACHE_TESTS: Mutex<()> = Mutex::new(());
+
+    #[must_use = "hold the guard for the whole test, or the cache is shared again"]
+    fn clear_answers() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test poisons this, and the next one still has to run: what
+        // it guards is wiped by every caller anyway, so the poison carries no
+        // information worth propagating.
+        let guard = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         if let Ok(mut g) = ANSWERS.lock() {
             *g = None;
         }
+        guard
     }
 
     #[test]
     fn a_cached_answer_is_restamped_for_the_client_that_asks() {
-        clear_answers();
+        let _cache = clear_answers();
         let name = "cache-restamp.example";
         let stored = reply_for(name, 0x1111, [45, 155, 204, 190]);
         remember_answer(
@@ -1523,7 +1538,7 @@ mod tests {
     /// without an OPT record would be handing back a malformed message.
     #[test]
     fn a_differently_shaped_question_is_a_miss() {
-        clear_answers();
+        let _cache = clear_answers();
         let name = "cache-shape.example";
         remember_answer(
             &query_for(name, 1, false),
@@ -1541,7 +1556,7 @@ mod tests {
     /// these providers may move the address.
     #[test]
     fn a_served_answer_carries_the_time_it_already_spent_in_the_cache() {
-        clear_answers();
+        let _cache = clear_answers();
         let name = "cache-ttl.example";
         let query = query_for(name, 3, false);
         remember_answer(
@@ -1565,7 +1580,7 @@ mod tests {
     /// measured substituters (I22) - is the better thing to fall through to.
     #[test]
     fn only_a_substitution_survives_past_its_freshness() {
-        clear_answers();
+        let _cache = clear_answers();
         for (name, verdict, expected) in [
             ("stale-sub.example", Verdict::Substituted, true),
             ("stale-pass.example", Verdict::Passthrough, false),
@@ -1597,7 +1612,7 @@ mod tests {
     /// or every real query still goes upstream while the cache serves nobody.
     #[test]
     fn warming_replays_the_shapes_a_client_actually_sent() {
-        clear_answers();
+        let _cache = clear_answers();
         let name = "warm-shape.example";
         let asked = query_for(name, 0x4242, true);
         remember_answer(
@@ -1665,7 +1680,7 @@ mod tests {
     /// hold: that is the difference between one lost race and an hour of them.
     #[test]
     fn a_substitution_in_hand_beats_a_fresh_genuine_answer() {
-        clear_answers();
+        let _cache = clear_answers();
         let name = "prefer-sub.example";
         let query = query_for(name, 1, false);
         let good = reply_for(name, 1, [45, 155, 204, 190]);
@@ -1697,7 +1712,7 @@ mod tests {
     /// to answer would only push Windows onto the unvetted NRPT fallback.
     #[test]
     fn a_genuine_answer_is_served_when_there_is_nothing_better() {
-        clear_answers();
+        let _cache = clear_answers();
         let name = "no-sub.example";
         let query = query_for(name, 2, false);
         let genuine = reply_for(name, 2, [172, 217, 115, 4]);
@@ -1710,7 +1725,7 @@ mod tests {
     /// has to prime the name, or the first query pays the full cold price.
     #[test]
     fn an_unseen_name_is_warmed_with_a_plain_query() {
-        clear_answers();
+        let _cache = clear_answers();
         let queries = warm_queries(&["warm-unseen.example"]);
         assert_eq!(queries.len(), 1);
         assert_eq!(

@@ -76,7 +76,9 @@ pub const LISTEN_PORT: u16 = 53;
 ///     moved, so "carried nothing" missed it), and the bench backs off.
 /// 21 = the relay leg asks for `cloudcode-pa` instead of `daily-`, which costs
 ///     it a second proxy hop: 2.14 s median down to 0.22 s, and no variance.
-pub const RELAY_VERSION: u32 = 21;
+/// 22 = the route is checked by a probe on the warm loop instead of by someone's
+///     request, and a burst of in-flight failures no longer lengthens the bench.
+pub const RELAY_VERSION: u32 = 22;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -305,11 +307,26 @@ const WARM_EVERY: Duration = Duration::from_secs(15);
 /// not reliably fit in that second (race, then a liveness probe, and a provider
 /// that goes quiet costs the whole timeout), and it does not have to: doing the
 /// work on a timer instead means the client's query is answered from memory.
+/// How often the relay route is checked while it is being used. Rare, because a
+/// working route needs no supervision and the probe is a real request.
+const PROBE_HEALTHY_EVERY: Duration = Duration::from_secs(2 * 60);
+
 fn warm_forever() {
+    let mut since_probe = PROBE_HEALTHY_EVERY;
     loop {
         let egress = isp_interface();
         resolvers::warm(dns::core_namespaces(), egress);
+        // Checked on our own time rather than with someone's request. While the
+        // route is benched this runs every pass, because the cost being paid then
+        // is every client sitting on the slow route for as long as it takes to
+        // notice the relay came back - which was twenty minutes after a flap that
+        // lasted seconds.
+        if proxy::relay_is_benched() || since_probe >= PROBE_HEALTHY_EVERY {
+            proxy::probe_relay();
+            since_probe = Duration::ZERO;
+        }
         thread::sleep(WARM_EVERY);
+        since_probe += WARM_EVERY;
     }
 }
 

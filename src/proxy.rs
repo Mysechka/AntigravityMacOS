@@ -56,10 +56,19 @@ const CA_NAME: &str = "AG Unlocker local CA";
 #[path = "relay.rs"]
 mod relay;
 #[cfg(relay)]
-pub use relay::relay_available;
+pub use relay::{probe_relay, relay_available, relay_is_benched};
 
 #[cfg(not(relay))]
 pub fn relay_available() -> bool {
+    false
+}
+
+/// No relay route to check in a build that has no relay module.
+#[cfg(not(relay))]
+pub fn probe_relay() {}
+
+#[cfg(not(relay))]
+pub fn relay_is_benched() -> bool {
     false
 }
 
