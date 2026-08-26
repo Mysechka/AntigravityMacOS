@@ -248,14 +248,59 @@ pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
 /// Removes them, but only while they still hold what we wrote - a user may have
 /// a proxy of their own, and taking that away would be worse than any bug here.
 pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
-    if current_env(PROXY_ENV_VAR).as_deref() != Some(url) {
-        return Ok(());
+    // Every variable is judged and removed on its own, and nothing stops at the
+    // first failure. A half-removed proxy is worse than either state: the value
+    // left behind names a loopback port whose listener the revert has just
+    // deleted, so every program that honours it loses the network. That was
+    // reported from a real machine as "не работает выход в интернет".
+    let mut trouble: Vec<String> = Vec::new();
+
+    if current_env(PROXY_ENV_VAR).is_some_and(|v| is_our_proxy_value(&v, url)) {
+        if let Err(e) = set_env(PROXY_ENV_VAR, None) {
+            trouble.push(e);
+        }
     }
-    set_env(PROXY_ENV_VAR, None)?;
     if current_env(NO_PROXY_ENV_VAR).as_deref() == Some(NO_PROXY_VALUE) {
-        set_env(NO_PROXY_ENV_VAR, None)?;
+        if let Err(e) = set_env(NO_PROXY_ENV_VAR, None) {
+            trouble.push(e);
+        }
     }
-    clear_node_ca(ca_path)
+    if let Err(e) = clear_node_ca(ca_path) {
+        trouble.push(e);
+    }
+
+    if trouble.is_empty() {
+        Ok(())
+    } else {
+        Err(trouble.join("; "))
+    }
+}
+
+/// Whether an `HTTPS_PROXY` value is one this tool wrote.
+///
+/// Compared on the **address**, not on the exact string. A value that has been
+/// through a settings dialog, a shell or another tool's rewrite can differ from
+/// what we wrote by a trailing slash or the case of the scheme and still be
+/// ours - and an exact comparison used to bail on that, leaving the variable
+/// pointing at a port that no longer answers.
+///
+/// Safe because the address is loopback and a fixed port that only this tool
+/// listens on: a proxy the user chose for themselves never names it. Their own
+/// value is left alone, which matters more than removing ours.
+fn is_our_proxy_value(value: &str, url: &str) -> bool {
+    let strip = |s: &str| {
+        s.trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .to_string()
+    };
+    let ours = strip(url);
+    // Equality, not `contains`: a test caught `socks5://127.0.0.1:53129x`
+    // passing a substring check, and `…:531290` would have too. Removing a
+    // proxy that is not ours is the worse of the two failures here.
+    !ours.is_empty() && strip(value) == ours
 }
 
 /// Drops `NODE_EXTRA_CA_CERTS` if it still holds `ca_path`, leaving a value the
@@ -275,9 +320,6 @@ pub fn clear_node_ca(ca_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn proxy_is_applied(url: &str) -> bool {
-    current_env(PROXY_ENV_VAR).as_deref() == Some(url)
-}
 
 fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
     let literal = match value {
@@ -313,6 +355,47 @@ fn current_cli_endpoint() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug users hit: a revert that left `HTTPS_PROXY` naming a port it had
+    /// just deleted, so nothing on the machine could reach the network. Part of
+    /// it was an exact string comparison - a value that had been through a
+    /// settings dialog or another tool came back with a trailing slash or a
+    /// different case and was not recognised as ours.
+    #[test]
+    fn our_proxy_value_is_recognised_however_it_was_written_back() {
+        let url = "http://127.0.0.1:53129";
+        for shape in [
+            "http://127.0.0.1:53129",
+            "http://127.0.0.1:53129/",
+            "HTTP://127.0.0.1:53129",
+            "  http://127.0.0.1:53129  ",
+            "127.0.0.1:53129",
+            "https://127.0.0.1:53129",
+        ] {
+            assert!(is_our_proxy_value(shape, url), "should be ours: {:?}", shape);
+        }
+    }
+
+    /// The other half, and the more important one: a proxy the user chose for
+    /// themselves must survive our revert untouched. Removing someone else's
+    /// proxy is a worse failure than leaving ours behind.
+    #[test]
+    fn a_proxy_the_user_chose_is_never_removed() {
+        let url = "http://127.0.0.1:53129";
+        for theirs in [
+            "http://127.0.0.1:1371",
+            "http://proxy.example.com:8080",
+            "http://10.0.0.1:53129",
+            "socks5://127.0.0.1:53129x",
+            "",
+        ] {
+            assert!(
+                !is_our_proxy_value(theirs, url),
+                "must be left alone: {:?}",
+                theirs
+            );
+        }
+    }
 
     const REAL: &str = "{\n    \"workbench.colorTheme\": \"Solarized Dark\",\n    \"securecoder.enabled\": true\n}";
 

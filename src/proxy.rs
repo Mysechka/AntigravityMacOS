@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use rustls::{ClientConfig, ClientConnection};
 
 use crate::upstream;
-use crate::utils::{no_window, powershell};
+use crate::utils::no_window;
 
 // The fallback route: unblock the traffic instead of the name.
 //
@@ -101,7 +101,7 @@ const RESP_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 const RESP_BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
 const RESP_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\r\n";
 
-// Cleanup only, from here to `ca_is_trusted`. Up to 2.9.1_27 the fallback route
+// Cleanup only, from here to `untrust_ca`. Up to 2.9.1_27 the fallback route
 // terminated TLS and needed a per-machine CA; the relay route replaced it and
 // needs none, so nothing here creates or signs anything. What is left finds the
 // old certificate and takes it out, because a machine that ran an earlier build
@@ -142,17 +142,11 @@ pub fn untrust_ca() {
     fs::remove_file(ca_key_path()).ok();
 }
 
-/// True when a certificate an older build installed is still in the user's root
-/// store - i.e. when there is something for `untrust_ca` to do.
-pub fn ca_is_trusted() -> bool {
-    powershell(&format!(
-        "if (Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object {{ $_.Subject -like '*{}*' }}) {{ 'yes' }} else {{ 'no' }}",
-        CA_NAME
-    ))
-    .map_or(false, |o| {
-        String::from_utf8_lossy(&o.stdout).trim() == "yes"
-    })
-}
+// There used to be a `ca_is_trusted()` here, to decide whether `untrust_ca` had
+// anything to do. It was the gate on the revert, and the gate is what let a
+// machine come out of a revert with its proxy variables still set. `untrust_ca`
+// is idempotent and costs one `certutil` call, so asking first bought nothing
+// and could only ever skip work that needed doing.
 
 /// The same client configuration, for the resolver's handshake probe.
 ///

@@ -397,28 +397,32 @@ fn handle_restore_dns() {
     thread::sleep(Duration::from_secs(2));
 }
 
-/// Turns the fallback route off and takes its certificate authority back out of
-/// the trust store.
+/// Puts the environment back: the proxy variables, and any certificate an older
+/// build left in the trust store.
 ///
-/// Called from both undo paths and always run to completion: a root certificate
-/// left behind after a revert would be the worst thing this tool could do, so
-/// nothing here is allowed to short-circuit on an earlier step finding nothing.
+/// **Both undo paths call this, and it never returns early.** It used to check
+/// first and skip when nothing looked set, and the full revert did not call it
+/// at all - so a machine could come out of "Полный откат" with `HTTPS_PROXY`
+/// still naming `127.0.0.1:53129`, a port whose listener the same revert had
+/// just deleted. Everything that honours that variable then loses the network,
+/// which is exactly how it was reported: "не удаляет … и не работает выход в
+/// интернет".
+///
+/// So: no gate, no early return, and every step runs even if the one before it
+/// failed. Half of it left behind is worse than either whole state.
 fn disable_fallback_proxy() {
     let url = proxy::proxy_url();
     let ca = proxy::ca_cert_path().to_string_lossy().to_string();
-    let had_env = endpoint::proxy_is_applied(&url);
-    let had_ca = proxy::ca_is_trusted();
-    if !had_env && !had_ca {
-        return;
-    }
-    print!("Отключение резервного прокси и удаление его сертификата... ");
+    print!("Возврат переменных среды (HTTPS_PROXY, NO_PROXY)... ");
     io::stdout().flush().ok();
-    if let Err(e) = endpoint::remove_proxy(&url, &ca) {
-        println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e);
-        return;
-    }
+    let env = endpoint::remove_proxy(&url, &ca);
+    // Runs whatever the variables did: a root certificate left behind after a
+    // revert would be the worst thing this tool could do.
     proxy::untrust_ca();
-    println!("готово.");
+    match env {
+        Ok(()) => println!("готово."),
+        Err(e) => println!("\x1b[33m{}\x1b[0m\x1b[92m", e),
+    }
 }
 
 /// Asks, once per run of menu 1, whether the user has a proxy of their own
@@ -616,6 +620,11 @@ fn handle_revert_all() {
         Ok(_) => println!("готово."),
         Err(e) => println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e),
     }
+
+    // The variables come out here too, not only in menu 6. This is the path a
+    // user takes when they want their machine back, and it was the one leaving
+    // `HTTPS_PROXY` pointing at a port it had just deleted.
+    disable_fallback_proxy();
 
     // The user's own proxy address is our configuration file, so a full revert
     // takes it with everything else. Menu 6 deliberately leaves it: that only
