@@ -16,12 +16,14 @@ mod dns_client;
 mod dns_forwarder;
 mod egress;
 mod endpoint;
+mod health;
 mod hosts_pin;
 mod patch_binary;
 mod patch_gemini;
 mod patch_ide;
 mod proxy;
 mod resolvers;
+mod upstream;
 mod utils;
 mod watchdog;
 
@@ -419,6 +421,102 @@ fn disable_fallback_proxy() {
     println!("готово.");
 }
 
+/// Asks, once per run of menu 1, whether the user has a proxy of their own
+/// abroad - and takes Enter for an answer.
+///
+/// This is the best route there is when it exists: proven live, a Dutch CONNECT
+/// proxy got a correct answer out of the model with our relay untouched and not
+/// one DNS rule involved. It is also *theirs*, which is the part that matters -
+/// every other route here leans on a third party we picked. So it is offered
+/// plainly, tested before it is believed, and skipped with one keypress.
+fn ask_for_own_proxy() {
+    let current = upstream::configured();
+    println!();
+    println!(
+        "\x1b[38;5;154mСвой прокси за рубежом — если он у вас есть (необязательно)\x1b[0m\x1b[92m"
+    );
+    println!("  Трафик Antigravity к серверам Google пойдёт через него. Это самый");
+    println!("  быстрый и надёжный путь, потому что прокси ваш, а не чужой.");
+    println!("  Формат:  адрес:порт          например  127.0.0.1:1371");
+    println!("  С паролем:  логин:пароль@адрес:порт");
+    println!("  Нужен HTTP-прокси (не SOCKS).");
+    match &current {
+        Some(up) => {
+            println!("  Сейчас задан: {}", up.display());
+            println!("  Enter — оставить, «-» — убрать, либо введите другой.");
+        }
+        None => println!("  Enter — пропустить, всё будет работать как и раньше."),
+    }
+
+    let answer = prompt("> ");
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return;
+    }
+    if answer == "-" {
+        upstream::clear();
+        println!("Свой прокси убран — трафик пойдёт прежним путём.");
+        thread::sleep(Duration::from_secs(2));
+        return;
+    }
+
+    let up = match upstream::parse(answer) {
+        Ok(up) => up,
+        Err(why) => {
+            println!("\x1b[33mНе понял адрес: {}\x1b[0m\x1b[92m", why);
+            thread::sleep(Duration::from_secs(3));
+            return;
+        }
+    };
+
+    // Tested before it is trusted. A proxy that is merely reachable proves
+    // nothing - the relay accepted tunnels for an hour while cutting every one -
+    // so this does the whole thing: connect, TLS to Google inside it, get an
+    // answer back.
+    print!("Проверка прокси... ");
+    io::stdout().flush().ok();
+    if let Err(why) = upstream::probe(&up) {
+        println!("\x1b[33mне работает: {}\x1b[0m\x1b[92m", why);
+        if !prompt("Сохранить всё равно? (y/N): ").eq_ignore_ascii_case("y") {
+            return;
+        }
+        save_own_proxy(&up);
+        return;
+    }
+
+    // The one thing worth checking beyond "it works": where it comes out. A proxy
+    // that surfaces in the blocked region changes the address and nothing else -
+    // measured on WARP, which reported the same country as no proxy at all - so
+    // it cannot lift the gate, and saying so now saves a long misunderstanding.
+    match upstream::exit_country(&up) {
+        Some(loc) if upstream::region_is_blocked(&loc) => {
+            println!("работает, но выходит в «{}».", loc);
+            println!("\x1b[33mЭто та же страна, что и без прокси, — блокировка так не снимется.");
+            println!("Сохранить можно: пока выход такой, трафик идёт прежним путём,");
+            println!("а как только прокси сменит адрес выхода на страну без");
+            println!("блокировки — он включится сам.\x1b[0m\x1b[92m");
+            if !prompt("Сохранить? (y/N): ").eq_ignore_ascii_case("y") {
+                return;
+            }
+        }
+        Some(loc) => println!("OK, выход в «{}».", loc),
+        None => println!("OK (страну выхода определить не удалось)."),
+    }
+    save_own_proxy(&up);
+}
+
+fn save_own_proxy(up: &upstream::Upstream) {
+    match upstream::save(up) {
+        Ok(()) => {
+            println!("Свой прокси сохранён: {}", up.display());
+            println!("Если он перестанет отвечать, трафик сам пойдёт прежним путём,");
+            println!("а когда заработает снова — вернётся на него.");
+        }
+        Err(e) => println!("\x1b[33mНе удалось сохранить: {}\x1b[0m\x1b[92m", e),
+    }
+    thread::sleep(Duration::from_secs(3));
+}
+
 /// Takes out the certificate authority a build up to 2.9.1_27 installed.
 ///
 /// That route is gone - the relay reaches the same backends with no CA at all -
@@ -518,6 +616,12 @@ fn handle_revert_all() {
         Ok(_) => println!("готово."),
         Err(e) => println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e),
     }
+
+    // The user's own proxy address is our configuration file, so a full revert
+    // takes it with everything else. Menu 6 deliberately leaves it: that only
+    // stops the DNS service, the setting is inert without the relay process
+    // anyway, and pressing 1 again should not mean typing it in again.
+    upstream::clear();
 
     print_results(&reverted, &[]);
 }
@@ -715,6 +819,13 @@ fn handle_patch_antigravity() {
     // Last, and never earlier: the CA may only go once the relay that signs with
     // it has actually been replaced. See `remove_legacy_ca`.
     remove_legacy_ca();
+
+    // Asked after the routes are in place, so the answer is "do you have
+    // something better" rather than "how should this work" - and so that Enter
+    // leaves a machine that already works.
+    if !successes.is_empty() || !failures.is_empty() {
+        ask_for_own_proxy();
+    }
 
     print_results(&successes, &failures);
 }

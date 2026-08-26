@@ -11,6 +11,7 @@ use crate::dns_client;
 use crate::egress;
 use crate::proxy;
 use crate::resolvers::{self, Verdict};
+use crate::upstream;
 
 // A loopback DNS relay, so the answers stay fresh.
 //
@@ -315,6 +316,7 @@ const PROBE_HEALTHY_EVERY: Duration = Duration::from_secs(2 * 60);
 
 fn warm_forever() {
     let mut since_probe = PROBE_HEALTHY_EVERY;
+    let mut since_upstream = PROBE_HEALTHY_EVERY;
     loop {
         let egress = isp_interface();
         resolvers::warm(dns::core_namespaces(), egress);
@@ -327,8 +329,17 @@ fn warm_forever() {
             proxy::probe_relay();
             since_probe = Duration::ZERO;
         }
+        // The user's own proxy is checked the same way and for the same reason:
+        // it must be stood down before a request meets it, and picked back up
+        // the moment it works again - which is what they asked for when they
+        // gave us one.
+        if upstream::HEALTH.is_benched() || since_upstream >= PROBE_HEALTHY_EVERY {
+            upstream::probe_health();
+            since_upstream = Duration::ZERO;
+        }
         thread::sleep(WARM_EVERY);
         since_probe += WARM_EVERY;
+        since_upstream += WARM_EVERY;
     }
 }
 

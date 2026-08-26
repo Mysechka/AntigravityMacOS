@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use rustls::{ClientConfig, ClientConnection};
 
+use crate::upstream;
 use crate::utils::{no_window, powershell};
 
 // The fallback route: unblock the traffic instead of the name.
@@ -176,6 +177,52 @@ fn upstream_config() -> Arc<ClientConfig> {
     .clone()
 }
 
+/// The two region-gated CloudCode endpoints - the only names that ever need a
+/// route other than a plain direct tunnel. Everything else reaches genuine
+/// Google unaided, so it is never sent through anybody's proxy.
+///
+/// Lives here rather than in the private relay module because it is policy, not
+/// method: every route has to agree on which hosts it applies to, and a second
+/// copy of a list like this drifts.
+pub fn is_gate_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    h == "cloudcode-pa.googleapis.com" || h == "daily-cloudcode-pa.googleapis.com"
+}
+
+/// Sends a gate host through the user's own proxy, when they gave us one and it
+/// is currently working. `Err` hands the client back untouched for the next
+/// route to try - nothing has been said to it yet.
+///
+/// Health is judged by the warm loop's probe, not by what happens here, with one
+/// exception: a proxy that will not even accept the `CONNECT` is unambiguously
+/// down and says so immediately. Everything subtler - accepting tunnels and
+/// cutting them at the handshake, which is exactly how the relay failed - is left
+/// to the probe, because "bytes moved" is not the same question as "it worked"
+/// and reading it that way once already let an outage run.
+fn try_own_proxy(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
+    if port != 443 || !is_gate_host(host) || !upstream::available() {
+        return Err(client);
+    }
+    let Some(up) = upstream::configured() else {
+        return Err(client);
+    };
+    let upstream_sock = match upstream::open(&up, host, port) {
+        Ok(sock) => sock,
+        Err(why) => {
+            crate::dns_forwarder::log_proxy(&format!("свой прокси {}: {}", up.display(), why));
+            upstream::HEALTH.note(false);
+            return Err(client);
+        }
+    };
+    // Committed: from here the client is talking to Google through their proxy.
+    if client.write_all(RESP_ESTABLISHED).is_err() {
+        return Ok(());
+    }
+    crate::dns_forwarder::log_proxy(&format!("свой прокси -> {}", host));
+    splice(client, upstream_sock);
+    Ok(())
+}
+
 /// `CONNECT host:port HTTP/1.1` and the headers after it, up to the blank line.
 ///
 /// Returns the target. Anything that is not a CONNECT is refused rather than
@@ -241,7 +288,7 @@ fn would_block(e: &io::Error) -> bool {
 
 /// Raw byte tunnel, for everything this proxy has no business decrypting.
 fn tunnel(mut client: TcpStream, host: &str, port: u16) {
-    let Ok(mut upstream) = TcpStream::connect((host, port)) else {
+    let Ok(upstream) = TcpStream::connect((host, port)) else {
         // The client is still waiting for a status line; without one it sits
         // there until it gives up, which reads as "the proxy hung" rather than
         // "that host is unreachable".
@@ -251,6 +298,15 @@ fn tunnel(mut client: TcpStream, host: &str, port: u16) {
     if client.write_all(RESP_ESTABLISHED).is_err() {
         return;
     }
+    splice(client, upstream);
+}
+
+/// Moves raw bytes between two sockets until one of them ends.
+///
+/// Split out of `tunnel` because a tunnel through the user's proxy is the same
+/// splice with a socket that was opened differently - and a second copy of the
+/// teardown discipline below would be a second place to get it wrong.
+fn splice(mut client: TcpStream, mut upstream: TcpStream) {
     let Ok(mut client_w) = client.try_clone() else {
         return;
     };
@@ -311,7 +367,7 @@ fn handshake(conn: &mut ClientConnection, sock: &mut TcpStream) -> Result<(), St
 /// (`cfg(not(relay))`) and always falls through to the DNS route.
 #[cfg(relay)]
 fn try_relay_route(client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
-    if port == 443 && relay::relay_available() && relay::is_gate_host(host) {
+    if port == 443 && relay::relay_available() && is_gate_host(host) {
         relay::relay_tunnel(client, host, port)
     } else {
         Err(client)
@@ -334,10 +390,22 @@ fn serve(mut client: TcpStream, _if_index: u32) {
         Request::Gone => return,
     };
 
-    // Gate hosts take the relay tunnel first (cert-free, end-to-end TLS). If it is
-    // unavailable - no key baked in (a public build), relay down, or the credential
-    // revoked - the client is handed back untouched and falls through to the direct
-    // tunnel below.
+    // Three routes for a gate host, best first, each handing the client back
+    // untouched if it cannot serve it:
+    //
+    //   1. the user's own proxy, when they gave us one. It is theirs, it needs no
+    //      DNS trickery and no third party we chose, and where it egresses in a
+    //      permitted region it beats everything below (kb/dns.md).
+    //   2. the relay, cert-free but somebody else's and revocable.
+    //   3. a plain direct tunnel, which the DNS layer has already pointed at a
+    //      substituted address.
+    //
+    // Nothing is decided before `200 Connection Established` goes out, so falling
+    // from one to the next costs the client nothing (I35).
+    let client = match try_own_proxy(client, &host, port) {
+        Ok(()) => return,
+        Err(returned) => returned,
+    };
     let client = match try_relay_route(client, &host, port) {
         Ok(()) => return,
         Err(returned) => returned,
