@@ -81,7 +81,7 @@ pub const LISTEN_PORT: u16 = 53;
 ///     request, and a burst of in-flight failures no longer lengthens the bench.
 /// 23 = every child process it shells out to is bounded, so a hung helper can no
 ///     longer stop it dead.
-pub const RELAY_VERSION: u32 = 23;
+pub const RELAY_VERSION: u32 = 25;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -317,6 +317,7 @@ const PROBE_HEALTHY_EVERY: Duration = Duration::from_secs(2 * 60);
 fn warm_forever() {
     let mut since_probe = PROBE_HEALTHY_EVERY;
     let mut since_upstream = PROBE_HEALTHY_EVERY;
+    let mut since_exits = PROBE_HEALTHY_EVERY;
     loop {
         let egress = isp_interface();
         resolvers::warm(dns::core_namespaces(), egress);
@@ -333,13 +334,26 @@ fn warm_forever() {
         // it must be stood down before a request meets it, and picked back up
         // the moment it works again - which is what they asked for when they
         // gave us one.
-        if upstream::HEALTH.is_benched() || since_upstream >= PROBE_HEALTHY_EVERY {
+        if upstream::OWN.health.is_benched() || since_upstream >= PROBE_HEALTHY_EVERY {
             upstream::probe_health();
             since_upstream = Duration::ZERO;
+        }
+        // The built-in exits are checked on the same clock in *both* states, and
+        // that is the one place this deviates from the rule above. Probing a
+        // benched route every pass is right when the alternative is the seven-second
+        // DNS route; these sit above the relay, so what a slower revival costs is a
+        // route that is merely quicker - and the cost of the other choice is a
+        // connection every fifteen seconds, from every machine running this tool,
+        // to somebody's free proxy. Being a considerate guest is what keeps the
+        // route working at all.
+        if since_exits >= PROBE_HEALTHY_EVERY {
+            proxy::probe_exits();
+            since_exits = Duration::ZERO;
         }
         thread::sleep(WARM_EVERY);
         since_probe += WARM_EVERY;
         since_upstream += WARM_EVERY;
+        since_exits += WARM_EVERY;
     }
 }
 

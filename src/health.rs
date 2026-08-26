@@ -108,8 +108,16 @@ impl Health {
             *streak = streak.saturating_add(1);
             how_long = FIRST_BENCH * 2u32.saturating_pow(streak.saturating_sub(1).min(DOUBLINGS));
         }
-        if let Ok(mut benched) = self.benched.lock() {
-            *benched = Some((Instant::now(), how_long));
+        let before = match self.benched.lock() {
+            Ok(mut benched) => benched.replace((Instant::now(), how_long)),
+            Err(_) => None,
+        };
+        // Once per change, not once per probe. The bench stops doubling at the
+        // maximum, so a route that is simply gone - a proxy the user configured
+        // and no longer runs - otherwise writes the same line every probe pass
+        // forever, and the log is the one place a real fault has to be visible.
+        if before.map(|(_, was)| was) == Some(how_long) {
+            return;
         }
         crate::dns_forwarder::log_proxy(&format!(
             "{} отложен на {} мин — не отвечает; трафик идёт другим путём",

@@ -18,29 +18,165 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
 
 use crate::health::Health;
 
-/// Reaching the proxy itself. It is usually on loopback or a short hop away.
-const CONNECT_BUDGET: Duration = Duration::from_secs(5);
-/// Waiting for its answer to our `CONNECT`, and for a probe to complete.
-const REPLY_BUDGET: Duration = Duration::from_secs(10);
+/// How long `open` may spend reaching a proxy and reading its answer for the
+/// region check - which asks a different question from route health, runs rarely,
+/// and is worth waiting out rather than repeating.
+const PROBE_OPEN_BUDGET: Duration = Duration::from_secs(15);
+/// The same for every path a request can take, and for the health probe that
+/// stands in for one.
+///
+/// Much shorter, and the reason is not impatience. Falling from one route to the
+/// next is free in correctness - nothing is committed before the `200` (I35) - but
+/// it is not free in time, and the two were confused. A route that has not
+/// answered a `CONNECT` in three seconds is not going to save this request: the
+/// route below it is already there, and whether the slow one is really down is a
+/// question for the warm loop, not for the person waiting. With the probe limit on
+/// this path a flapping exit cost 15 s per attempt and 30 s before its second
+/// failure benched it, which is most of what a long "Authenticating" was.
+pub const LIVE_OPEN_BUDGET: Duration = Duration::from_secs(3);
+/// Longest a probe's own request may take once the tunnel is open.
 const PROBE_BUDGET: Duration = Duration::from_secs(20);
 
 /// The host a probe asks for: the one the IDE actually uses, so a probe measures
 /// the path a request will take rather than a neighbouring one.
 const PROBE_HOST: &str = "daily-cloudcode-pa.googleapis.com";
 
-/// Health of this route, consulted before every connection and updated by the
-/// warm loop's probe.
-pub static HEALTH: Health = Health::new("Свой прокси");
+/// One route's standing, and the only place the two reasons a route stands down
+/// are kept apart (I44).
+///
+/// `health` is timed: a route that stopped answering is benched and the bench
+/// doubles, because waiting is the right response to an outage. `bad_exit` is not
+/// timed at all - a proxy that surfaces in the blocked region is useless *at that
+/// exit*, and no amount of waiting moves it, only a new address does. So that
+/// verdict is pinned to the address and released the moment it changes.
+///
+/// One of these per route, not one shared: the user's own proxy and each built-in
+/// exit fail independently, and a single pair of statics would have one dead exit
+/// bench every other route along with it.
+pub struct Route {
+    pub health: Health,
+    bad_exit: Mutex<Option<String>>,
+    /// How this route is named in the log - never its address. A built-in exit is
+    /// private, and a log file is the one thing users paste into public chats.
+    label: &'static str,
+}
+
+impl Route {
+    pub const fn new(label: &'static str) -> Self {
+        Route {
+            health: Health::new(label),
+            bad_exit: Mutex::new(None),
+            label,
+        }
+    }
+
+    /// Whether this route is worth trying for the next connection: answering, and
+    /// coming out somewhere Google will accept.
+    pub fn usable(&self) -> bool {
+        self.bad_exit().is_none() && !self.health.is_benched()
+    }
+
+    /// How this route is named in the log. Only the built-in exits ask - every
+    /// other route knows its own name at the call site - so a build without them
+    /// is honest about it rather than carrying a warning.
+    #[cfg_attr(not(exits), allow(dead_code))]
+    pub fn label(&self) -> &'static str {
+        self.label
+    }
+
+    /// The exit this route was last found unusable at, while it is standing down
+    /// for that reason.
+    fn bad_exit(&self) -> Option<String> {
+        self.bad_exit.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Records that this exit is in a blocked region, so the route stands down
+    /// until the address changes. Quiet when it is the same exit as last time -
+    /// this runs on a timer and would otherwise repeat itself forever.
+    fn note_blocked_exit(&self, ip: &str, loc: &str) {
+        let Ok(mut pinned) = self.bad_exit.lock() else {
+            return;
+        };
+        if pinned.as_deref() == Some(ip) {
+            return;
+        }
+        *pinned = Some(ip.to_string());
+        crate::dns_forwarder::log_proxy(&format!(
+            "{} выходит через {} ({}) — это заблокированный регион, маршрут отключён до смены выхода",
+            self.label, ip, loc
+        ));
+    }
+
+    /// Releases the pin, because the exit moved somewhere usable.
+    fn note_usable_exit(&self, ip: &str, loc: &str) {
+        let Ok(mut pinned) = self.bad_exit.lock() else {
+            return;
+        };
+        if pinned.is_none() {
+            return;
+        }
+        *pinned = None;
+        crate::dns_forwarder::log_proxy(&format!(
+            "{} сменил выход на {} ({}) — снова используем",
+            self.label, ip, loc
+        ));
+    }
+
+    /// The warm loop's whole check for one route, run on our own time and never
+    /// with somebody's request (I38).
+    ///
+    /// `check_region` is separate because the two halves cost differently. The
+    /// carry probe is one tunnel to Google; the region check is another full TLS
+    /// request, and for a built-in exit shared by every user of this tool that is
+    /// load somebody else pays for. So the caller decides how often it is worth
+    /// asking again where a route comes out.
+    pub fn probe(&self, up: &Upstream, check_region: bool) {
+        // Where it comes out is checked first, and separately, because it answers
+        // a different question. A proxy can be perfectly responsive and still be
+        // useless: if it surfaces in the blocked region Google refuses the request
+        // with the very 400 this whole tool exists to remove - and that refusal is
+        // invisible from here, because it arrives inside the client's own TLS. The
+        // exit address is the one part of it we *can* see, so it is what the route
+        // is judged on.
+        if check_region {
+            match exit_info(up) {
+                Some((ip, loc)) if region_is_blocked(&loc) => {
+                    self.note_blocked_exit(&ip, &loc);
+                    // Nothing else is worth measuring: it is not coming back until
+                    // the address changes, and this runs again shortly to see if
+                    // it has.
+                    return;
+                }
+                Some((ip, loc)) => self.note_usable_exit(&ip, &loc),
+                // No trace host was reachable through it. That is a fault of its
+                // own and the carry probe below will say so; it is not evidence
+                // about the region, so an existing verdict is left standing.
+                None => {}
+            }
+        }
+
+        match probe(up) {
+            Ok(()) => self.health.revive("проверка прошла"),
+            Err(why) => {
+                crate::dns_forwarder::log_proxy(&format!("{} не отвечает: {}", self.label, why));
+                self.health.probe_failed();
+            }
+        }
+    }
+}
+
+/// The user's own proxy, as a route. Built-in exits carry one of these each.
+pub static OWN: Route = Route::new("свой прокси");
 
 /// A user-supplied HTTP CONNECT proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,9 +297,9 @@ pub fn configured() -> Option<Upstream> {
 ///
 /// Three things have to hold: the user gave us one, it is answering, and it
 /// comes out somewhere Google will accept. The last is checked against a pinned
-/// address rather than a clock - see `BAD_EXIT`.
+/// address rather than a clock - see `Route`.
 pub fn available() -> bool {
-    configured().is_some() && bad_exit().is_none() && !HEALTH.is_benched()
+    configured().is_some() && OWN.usable()
 }
 
 fn basic(auth: &str) -> String {
@@ -185,20 +321,60 @@ fn basic(auth: &str) -> String {
     out
 }
 
-/// Opens a tunnel to `host:port` through the user's proxy.
+/// Reaches the proxy itself, inside `deadline` whatever shape its address is in.
+///
+/// A hostname has to be resolved before `connect_timeout` can be used at all,
+/// and the obvious `parse().unwrap_or_else(|_| TcpStream::connect(..))` silently
+/// drops the budget for exactly that case: a named proxy whose address black-holes
+/// then hangs on the OS default - about 21 s on Windows - with a live client
+/// waiting behind it. The budget is spent across every candidate address rather
+/// than granted to each, so the whole step is bounded however many a name has.
+fn connect_within_budget(host: &str, port: u16, deadline: Instant) -> Result<TcpStream, String> {
+    let addrs: Vec<_> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("адрес не разрешается: {}", e))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("адрес не разрешается".to_string());
+    }
+    let mut last = String::from("время вышло");
+    for addr in addrs {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&addr, left) {
+            Ok(sock) => return Ok(sock),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(format!("недоступен: {}", last))
+}
+
+/// Opens a tunnel to `host:port` through the given proxy.
 ///
 /// Everything that can fail happens here, before the caller has told its client
-/// anything - the same rule the relay route follows (I35). A `None` means the
+/// anything - the same rule the relay route follows (I35). An `Err` means the
 /// caller still holds an untouched client socket and can take another route.
-pub fn open(up: &Upstream, host: &str, port: u16) -> Result<TcpStream, String> {
-    let addr = format!("{}:{}", up.host, up.port);
-    let mut sock = addr
-        .parse()
-        .map(|a| TcpStream::connect_timeout(&a, CONNECT_BUDGET))
-        .unwrap_or_else(|_| TcpStream::connect(&addr))
-        .map_err(|e| format!("{} недоступен: {}", up.display(), e))?;
-    sock.set_read_timeout(Some(REPLY_BUDGET)).ok();
-    sock.set_write_timeout(Some(REPLY_BUDGET)).ok();
+///
+/// The error says only what went wrong, never which proxy it was: the caller
+/// knows that and names the route itself, and a built-in exit must not put its
+/// address in a log line (see `Route::label`).
+///
+/// `budget` covers the **whole** step - resolve, connect and read the answer -
+/// because that is the thing a waiting client experiences. Bounding each part
+/// separately is how three seconds of patience turns into fifteen (I43).
+pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<TcpStream, String> {
+    let deadline = Instant::now() + budget;
+    let mut sock = connect_within_budget(&up.host, up.port, deadline)?;
+    let left = || deadline.saturating_duration_since(Instant::now());
+    // A zero timeout means "block forever" to the OS, so a spent budget has to be
+    // an error here rather than a socket option.
+    if left().is_zero() {
+        return Err("прокси не ответил вовремя".to_string());
+    }
+    sock.set_read_timeout(Some(left())).ok();
+    sock.set_write_timeout(Some(left())).ok();
 
     let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
     if let Some(a) = &up.auth {
@@ -214,6 +390,11 @@ pub fn open(up: &Upstream, host: &str, port: u16) -> Result<TcpStream, String> {
         if head.len() > 8 * 1024 {
             return Err("прокси ответил чем-то очень длинным".to_string());
         }
+        // The socket timeout bounds one `read`; this bounds the loop, so a proxy
+        // dribbling a byte at a time cannot outlast the budget by repeating.
+        if left().is_zero() {
+            return Err("прокси не ответил вовремя".to_string());
+        }
         match sock.read(&mut byte) {
             Ok(0) => return Err("прокси закрыл соединение".to_string()),
             Ok(_) => head.push(byte[0]),
@@ -225,14 +406,27 @@ pub fn open(up: &Upstream, host: &str, port: u16) -> Result<TcpStream, String> {
         .next()
         .unwrap_or("")
         .to_string();
+    // Not `starts_with("HTTP/1.1 200")`: a CONNECT proxy is free to answer on
+    // HTTP/1.0, and tinyproxy - which is what the built-in exits run - does.
     if !status.contains(" 200") {
-        // 407 is the one worth naming: it is a credential problem, not an outage,
-        // and it will not fix itself however long the route is benched.
+        // Two statuses are worth naming, because neither is an outage and neither
+        // fixes itself however long the route is benched: 407 is a credential
+        // problem, and 403 means this proxy filters by destination and does not
+        // carry the host we asked for.
         if status.contains(" 407") {
             return Err("прокси требует логин и пароль".to_string());
         }
+        if status.contains(" 403") {
+            return Err(format!("прокси не пропускает этот хост: {}", host));
+        }
         return Err(format!("прокси отказал: {}", status));
     }
+    // The budgets above bounded reaching the proxy and reading its answer. They
+    // are mine, not the caller's, so the socket goes back clean - a caller that
+    // wants one of its own (`probe`, `exit_info`) sets it immediately, and a
+    // tunnel wants none (see `proxy::splice`, and I37).
+    sock.set_read_timeout(None).ok();
+    sock.set_write_timeout(None).ok();
     Ok(sock)
 }
 
@@ -241,7 +435,12 @@ pub fn open(up: &Upstream, host: &str, port: u16) -> Result<TcpStream, String> {
 /// not merely that the proxy accepts a CONNECT - the relay taught that lesson by
 /// accepting tunnels for an hour and cutting every one at the handshake.
 pub fn probe(up: &Upstream) -> Result<(), String> {
-    let mut sock = open(up, PROBE_HOST, 443)?;
+    // Opened on the **live** budget, not the generous one. A probe exists to
+    // predict what a request will meet, so the two must agree on what "reachable"
+    // means: judge on 15 s and serve on 3 s and a merely-slow proxy flaps forever -
+    // revived by every probe, benched by the next two requests. The generosity
+    // belongs in the request below, which is measuring something else.
+    let mut sock = open(up, PROBE_HOST, 443, LIVE_OPEN_BUDGET)?;
     sock.set_read_timeout(Some(PROBE_BUDGET)).ok();
     sock.set_write_timeout(Some(PROBE_BUDGET)).ok();
     let name = ServerName::try_from(PROBE_HOST).map_err(|e| e.to_string())?;
@@ -269,41 +468,17 @@ pub fn probe(up: &Upstream) -> Result<(), String> {
 }
 
 /// Checked on the warm loop, so the route is judged on our time and never with
-/// somebody's request.
+/// somebody's request. A no-op when the user never gave us a proxy.
+///
+/// The region half runs every time here, unlike the built-in exits: this is one
+/// proxy belonging to the person in front of us, so there is nobody else to be
+/// considerate towards, and it is the route most likely to be a VPN that quietly
+/// surfaces next door.
 pub fn probe_health() {
     let Some(up) = configured() else {
         return;
     };
-
-    // Where it comes out is checked first, and separately, because it answers a
-    // different question. A proxy can be perfectly responsive and still be
-    // useless: if it surfaces in the blocked region, Google refuses the request
-    // with the very 400 this whole tool exists to remove - and that refusal is
-    // invisible from here, because it arrives inside the client's own TLS. The
-    // exit address is the one part of it we *can* see, so it is what the route
-    // is judged on.
-    match exit_info(&up) {
-        Some((ip, loc)) if region_is_blocked(&loc) => {
-            note_blocked_exit(&ip, &loc);
-            // Nothing else is worth measuring: it is not coming back until the
-            // address changes, and this runs again in two minutes to see if it
-            // has.
-            return;
-        }
-        Some((ip, loc)) => note_usable_exit(&ip, &loc),
-        // Cloudflare unreachable through it. That is a fault of its own and the
-        // carry probe below will say so; it is not evidence about the region, so
-        // an existing verdict is left standing.
-        None => {}
-    }
-
-    match probe(&up) {
-        Ok(()) => HEALTH.revive("проверка прошла"),
-        Err(why) => {
-            crate::dns_forwarder::log_proxy(&format!("свой прокси не отвечает: {}", why));
-            HEALTH.probe_failed();
-        }
-    }
+    OWN.probe(&up, true);
 }
 
 /// Which country the proxy comes out in, as Cloudflare sees it.
@@ -323,18 +498,36 @@ pub fn exit_country(up: &Upstream) -> Option<String> {
 /// rotating to another one. Watching the address is how we notice that without
 /// asking the user to press anything.
 pub fn exit_info(up: &Upstream) -> Option<(String, String)> {
-    const HOST: &str = "www.cloudflare.com";
-    let mut sock = open(up, HOST, 443).ok()?;
+    TRACE_HOSTS.iter().find_map(|h| trace_through(up, h))
+}
+
+/// Hosts that will report an exit back, in the order they are tried.
+///
+/// `www.cloudflare.com` first: it is the canonical one, and it is not something a
+/// user's own proxy is likely to have an opinion about. The rest exist because a
+/// *filtering* proxy answers `403 Filtered` for it while carrying them perfectly
+/// well - which is exactly what the built-in exits are, somebody's AI-unblocking
+/// service with a whitelist. Measured through one: cloudflare.com refused, both
+/// of the others return a full trace.
+///
+/// Getting this wrong is not a small thing. A `None` from here leaves the previous
+/// region verdict standing, so a route whose exit had quietly moved into the
+/// blocked region would keep taking traffic and keep failing inside the client's
+/// own TLS, where none of it is visible to us.
+const TRACE_HOSTS: &[&str] = &["www.cloudflare.com", "chatgpt.com", "claude.ai"];
+
+fn trace_through(up: &Upstream, host: &'static str) -> Option<(String, String)> {
+    let mut sock = open(up, host, 443, PROBE_OPEN_BUDGET).ok()?;
     sock.set_read_timeout(Some(PROBE_BUDGET)).ok();
     sock.set_write_timeout(Some(PROBE_BUDGET)).ok();
-    let name = ServerName::try_from(HOST).ok()?;
+    let name = ServerName::try_from(host).ok()?;
     let mut tls = ClientConnection::new(crate::proxy::probe_config(), name).ok()?;
     let mut stream = rustls::Stream::new(&mut tls, &mut sock);
     stream
         .write_all(
             format!(
                 "GET /cdn-cgi/trace HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                HOST
+                host
             )
             .as_bytes(),
         )
@@ -357,52 +550,6 @@ pub fn exit_info(up: &Upstream) -> Option<(String, String)> {
             .filter(|v| !v.is_empty())
     };
     Some((field("ip=")?, field("loc=")?))
-}
-
-/// The exit the route was last found unusable at, if it is standing down for
-/// that reason.
-///
-/// Separate from the timed bench on purpose. A bench answers "is it responding",
-/// and waiting longer is the right response to that. This answers "does it come
-/// out somewhere Google will refuse", and no amount of waiting fixes it - only a
-/// different exit does. So it is held against the address itself: pinned when a
-/// blocked exit is seen, released the moment the address changes.
-static BAD_EXIT: Mutex<Option<String>> = Mutex::new(None);
-
-fn bad_exit() -> Option<String> {
-    BAD_EXIT.lock().ok().and_then(|g| g.clone())
-}
-
-/// Records that this exit is in a region that is blocked, so the route stands
-/// down until the address changes. Quiet when it is the same exit as last time -
-/// this runs on a timer and would otherwise repeat itself forever.
-fn note_blocked_exit(ip: &str, loc: &str) {
-    let Ok(mut pinned) = BAD_EXIT.lock() else {
-        return;
-    };
-    if pinned.as_deref() == Some(ip) {
-        return;
-    }
-    *pinned = Some(ip.to_string());
-    crate::dns_forwarder::log_proxy(&format!(
-        "свой прокси выходит через {} ({}) — это заблокированный регион,          маршрут отключён до смены выхода",
-        ip, loc
-    ));
-}
-
-/// Releases the pin, because the exit moved somewhere usable.
-fn note_usable_exit(ip: &str, loc: &str) {
-    let Ok(mut pinned) = BAD_EXIT.lock() else {
-        return;
-    };
-    if pinned.is_none() {
-        return;
-    }
-    *pinned = None;
-    crate::dns_forwarder::log_proxy(&format!(
-        "свой прокси сменил выход на {} ({}) — снова используем",
-        ip, loc
-    ));
 }
 
 /// Regions where a proxy is pointless, because they are the ones being blocked.
@@ -486,29 +633,48 @@ mod tests {
     /// A blocked exit stands the route down, and only a *different* address
     /// brings it back - not a timer, because waiting does not move a proxy.
     ///
-    /// The one test that touches the pin; keep it that way, or two of them in
-    /// parallel will fight over the same global.
+    /// On its own `Route` rather than a global, which is the point of there being
+    /// one per route: two of these could now run in parallel without fighting.
     #[test]
     fn a_blocked_exit_stands_the_route_down_until_the_address_changes() {
-        *BAD_EXIT.lock().unwrap() = None;
+        let r = Route::new("тест");
 
-        note_blocked_exit("203.0.113.7", "RU");
-        assert_eq!(bad_exit().as_deref(), Some("203.0.113.7"));
+        r.note_blocked_exit("203.0.113.7", "RU");
+        assert_eq!(r.bad_exit().as_deref(), Some("203.0.113.7"));
+        assert!(!r.usable(), "a blocked exit takes the route out of service");
 
         // Same exit seen again on the next pass: still down, and it must not
         // announce itself a second time.
-        note_blocked_exit("203.0.113.7", "RU");
-        assert_eq!(bad_exit().as_deref(), Some("203.0.113.7"));
+        r.note_blocked_exit("203.0.113.7", "RU");
+        assert_eq!(r.bad_exit().as_deref(), Some("203.0.113.7"));
 
         // Rotated, still blocked: down, now pinned to the new address.
-        note_blocked_exit("198.51.100.4", "BY");
-        assert_eq!(bad_exit().as_deref(), Some("198.51.100.4"));
+        r.note_blocked_exit("198.51.100.4", "BY");
+        assert_eq!(r.bad_exit().as_deref(), Some("198.51.100.4"));
 
         // Rotated somewhere usable: back in service.
-        note_usable_exit("203.0.113.9", "NL");
-        assert_eq!(bad_exit(), None);
-        note_usable_exit("203.0.113.9", "NL");
-        assert_eq!(bad_exit(), None);
+        r.note_usable_exit("203.0.113.9", "NL");
+        assert_eq!(r.bad_exit(), None);
+        assert!(r.usable());
+        r.note_usable_exit("203.0.113.9", "NL");
+        assert_eq!(r.bad_exit(), None);
+    }
+
+    /// One route standing down must not take another with it. This is the whole
+    /// reason `Route` exists rather than a pair of statics: with a shared pin, one
+    /// dead built-in exit would have benched the user's own proxy too.
+    #[test]
+    fn routes_stand_down_independently() {
+        let a = Route::new("тест A");
+        let b = Route::new("тест B");
+        a.note_blocked_exit("203.0.113.7", "RU");
+        a.health.note(false);
+        a.health.note(false);
+        assert!(!a.usable());
+        assert!(
+            b.usable(),
+            "B was never at fault and must still be in service"
+        );
     }
 
     /// Live: the whole path against a real proxy, which is the only way to know

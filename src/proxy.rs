@@ -73,6 +73,23 @@ pub fn relay_is_benched() -> bool {
     false
 }
 
+// The built-in exits - third-party CONNECT proxies that already egress in a
+// permitted region - live in the gitignored `src/exits.rs` with their address
+// list in `.exits`, compiled in only under `cfg(exits)`. Same arrangement as the
+// relay, for a different reason: the method here is not secret (it is the plain
+// CONNECT `upstream.rs` already speaks in public source), the addresses are, and
+// only because naming somebody else's free proxy in a public repository is how it
+// stops being one.
+#[cfg(exits)]
+#[path = "exits.rs"]
+mod exits;
+#[cfg(exits)]
+pub use exits::probe_health as probe_exits;
+
+/// No built-in exits to check in a build that has no exits module.
+#[cfg(not(exits))]
+pub fn probe_exits() {}
+
 // The byte pump's timings, the upstream handshake and `would_block` below are
 // the primitives the private relay module is built on, and its only users. A
 // public build has no such module, so each is marked dead-code-allowed under
@@ -200,11 +217,11 @@ fn try_own_proxy(mut client: TcpStream, host: &str, port: u16) -> Result<(), Tcp
     let Some(up) = upstream::configured() else {
         return Err(client);
     };
-    let upstream_sock = match upstream::open(&up, host, port) {
+    let upstream_sock = match upstream::open(&up, host, port, upstream::LIVE_OPEN_BUDGET) {
         Ok(sock) => sock,
         Err(why) => {
             crate::dns_forwarder::log_proxy(&format!("свой прокси {}: {}", up.display(), why));
-            upstream::HEALTH.note(false);
+            upstream::OWN.health.note(false);
             return Err(client);
         }
     };
@@ -301,6 +318,24 @@ fn tunnel(mut client: TcpStream, host: &str, port: u16) {
 /// splice with a socket that was opened differently - and a second copy of the
 /// teardown discipline below would be a second place to get it wrong.
 fn splice(mut client: TcpStream, mut upstream: TcpStream) {
+    // A tunnel sets its own idle policy, whatever the two sockets were carrying
+    // when they got here - the accept loop's silence limit on one, a CONNECT
+    // reply budget on the other. Neither is a tunnel policy, and a stray one is
+    // not harmless: `upstream::open`'s ten-second reply budget rode into the
+    // splice and killed every pooled connection at 10.3 s of silence. `io::copy`
+    // reads a timeout as the end of the stream, so the tunnel simply closed; the
+    // language server saw its pooled connection die on the next write and
+    // reconnected, over and over - 35 tunnels in 25 seconds, which is what a long
+    // hang on "Authenticating" looks like from this side. Only the relay route
+    // escaped it, because it pumps its own sockets (I37).
+    //
+    // None, rather than a reaper: expiring an idle tunnel is a real policy with a
+    // real risk of cutting a live stream (P4), and it belongs with the payload
+    // clock in the relay's pump, not smuggled in as a socket option.
+    for s in [&client, &upstream] {
+        s.set_read_timeout(None).ok();
+        s.set_write_timeout(None).ok();
+    }
     let Ok(mut client_w) = client.try_clone() else {
         return;
     };
@@ -322,21 +357,39 @@ fn splice(mut client: TcpStream, mut upstream: TcpStream) {
     up.join().ok();
 }
 
-/// Longest a candidate may take before it is not worth carrying traffic through.
+/// Longest one candidate address may take - connect *and* TLS together - before
+/// the next one deserves the rest of the budget.
+///
+/// Sized so a pool of several is actually walked: the relay's whole-route budget
+/// is 8 s, and at this slice three addresses get a real attempt instead of one
+/// black-holing address consuming almost all of it.
 #[cfg_attr(not(relay), allow(dead_code))]
-const UPSTREAM_PROBE_BUDGET: Duration = Duration::from_secs(6);
+pub const UPSTREAM_PROBE_BUDGET: Duration = Duration::from_millis(2500);
 
-/// Drives `conn` to a completed handshake over `sock`, or gives up.
+/// Drives `conn` to a completed handshake over `sock` before `deadline`, or gives
+/// up.
 ///
 /// Blocking with timeouts on purpose: this runs before the client has been told
 /// anything, so waiting here is honest, and the alternative - discovering a dead
 /// upstream halfway through a tunnel - has no way back.
 #[cfg_attr(not(relay), allow(dead_code))]
-fn handshake(conn: &mut ClientConnection, sock: &mut TcpStream) -> Result<(), String> {
+fn handshake(
+    conn: &mut ClientConnection,
+    sock: &mut TcpStream,
+    deadline: Instant,
+) -> Result<(), String> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err("таймаут".to_string());
+    }
     sock.set_nonblocking(false).ok();
-    sock.set_read_timeout(Some(UPSTREAM_PROBE_BUDGET)).ok();
-    sock.set_write_timeout(Some(UPSTREAM_PROBE_BUDGET)).ok();
-    let deadline = Instant::now() + UPSTREAM_PROBE_BUDGET;
+    // The socket timeouts come from the caller's deadline, not from a constant of
+    // our own. A fixed six seconds here is not a local decision: it is spent out of
+    // whatever budget the caller is holding, and one address that completes TCP and
+    // then black-holes TLS ate almost all of the relay pool's eight seconds, so the
+    // address that actually worked was never reached (G7, one layer up).
+    sock.set_read_timeout(Some(left)).ok();
+    sock.set_write_timeout(Some(left)).ok();
     while conn.is_handshaking() {
         if Instant::now() >= deadline {
             return Err("таймаут".to_string());
@@ -373,6 +426,23 @@ fn try_relay_route(client: TcpStream, _host: &str, _port: u16) -> Result<(), Tcp
     Err(client)
 }
 
+/// Tries the built-in exits for a gate host, else hands the client straight back.
+/// The only place the private exits module is touched; a build from the public
+/// source has no such module and falls through to the relay and the DNS route.
+#[cfg(exits)]
+fn try_builtin_exit(client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
+    if port == 443 && is_gate_host(host) && exits::available() {
+        exits::tunnel(client, host, port)
+    } else {
+        Err(client)
+    }
+}
+
+#[cfg(not(exits))]
+fn try_builtin_exit(client: TcpStream, _host: &str, _port: u16) -> Result<(), TcpStream> {
+    Err(client)
+}
+
 fn serve(mut client: TcpStream, _if_index: u32) {
     client.set_read_timeout(Some(REQUEST_IDLE)).ok();
     let (host, port) = match read_connect(&mut client) {
@@ -384,19 +454,29 @@ fn serve(mut client: TcpStream, _if_index: u32) {
         Request::Gone => return,
     };
 
-    // Three routes for a gate host, best first, each handing the client back
+    // Four routes for a gate host, best first, each handing the client back
     // untouched if it cannot serve it:
     //
-    //   1. the user's own proxy, when they gave us one. It is theirs, it needs no
-    //      DNS trickery and no third party we chose, and where it egresses in a
-    //      permitted region it beats everything below (kb/dns.md).
-    //   2. the relay, cert-free but somebody else's and revocable.
-    //   3. a plain direct tunnel, which the DNS layer has already pointed at a
+    //   1. the user's own proxy, when they gave us one. It stays first even though
+    //      the built-in exits below are usually faster: they typed it in by hand,
+    //      it is theirs rather than a third party we chose for them, and silently
+    //      overriding what somebody configured is not a speed optimisation. Almost
+    //      nobody sets one, so in practice route 2 is the first that runs.
+    //   2. a built-in exit - somebody else's CONNECT proxy that already egresses
+    //      in a permitted region, so it lifts the gate outright (S25) with no DNS
+    //      trickery, no credential and no certificate. Measured faster than the
+    //      relay and several times faster than the DNS route (kb/dns.md).
+    //   3. the relay, cert-free but somebody else's and revocable.
+    //   4. a plain direct tunnel, which the DNS layer has already pointed at a
     //      substituted address.
     //
     // Nothing is decided before `200 Connection Established` goes out, so falling
     // from one to the next costs the client nothing (I35).
     let client = match try_own_proxy(client, &host, port) {
+        Ok(()) => return,
+        Err(returned) => returned,
+    };
+    let client = match try_builtin_exit(client, &host, port) {
         Ok(()) => return,
         Err(returned) => returned,
     };
@@ -443,6 +523,81 @@ mod tests {
             assert_eq!(&line[line.len() - 4..], &[13u8, 10, 13, 10], "{:?}", line);
             assert!(!line[..line.len() - 4].contains(&10u8), "{:?}", line);
         }
+    }
+
+    /// A tunnel must not be closed by a budget that was only ever meant to bound
+    /// the CONNECT handshake.
+    ///
+    /// The regression this pins: `upstream::open` left its ten-second reply budget
+    /// on the socket it returned, `splice` handed that socket to `io::copy`, and a
+    /// timeout reads as end-of-stream - so every tunnel through the user's own
+    /// proxy or a built-in exit died at 10.3 s of silence. A pooling client
+    /// reconnects on the failed reuse, which showed up as a long hang on
+    /// "Authenticating" and 35 tunnels in 25 seconds in the log.
+    ///
+    /// Sixteen seconds of silence, comfortably past the old ten, then the tunnel
+    /// is used - a live client would fail here, not at the handshake.
+    ///
+    ///     cargo test an_idle_tunnel_outlives_the_connect_budget -- --ignored --nocapture
+    #[test]
+    #[ignore = "holds a tunnel open for 16 s against a real route; needs a live network"]
+    fn an_idle_tunnel_outlives_the_connect_budget() {
+        use rustls::pki_types::ServerName;
+        use rustls::ClientConnection;
+        use std::net::TcpListener;
+
+        const HOST: &str = "daily-cloudcode-pa.googleapis.com";
+        const IDLE: Duration = Duration::from_secs(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bound");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accepted");
+            serve(sock, 0);
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connected");
+        client
+            .write_all(
+                format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: {HOST}:443\r\n\r\n").as_bytes(),
+            )
+            .expect("sent CONNECT");
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(client.read(&mut byte).expect("reply"), 1, "proxy hung up");
+            head.push(byte[0]);
+        }
+        assert!(String::from_utf8_lossy(&head).contains(" 200"));
+
+        let name = ServerName::try_from(HOST).expect("name");
+        let mut tls = ClientConnection::new(probe_config(), name).expect("tls");
+        let mut stream = rustls::Stream::new(&mut tls, &mut client);
+        // Complete the handshake before going quiet, so the silence is measured on
+        // an established tunnel - which is the state a pooled connection sits in.
+        stream.flush().ok();
+
+        thread::sleep(IDLE);
+
+        stream
+            .write_all(
+                format!(
+                    "GET /v1internal:probe HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("the tunnel was closed under an idle client");
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).expect("no answer after idling");
+        assert!(
+            buf[..n].starts_with(b"HTTP/"),
+            "not an HTTP answer: {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+        println!(
+            "tunnel survived {} s idle and still carried a request",
+            IDLE.as_secs()
+        );
     }
 
     #[test]
