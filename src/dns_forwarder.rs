@@ -78,7 +78,9 @@ pub const LISTEN_PORT: u16 = 53;
 ///     it a second proxy hop: 2.14 s median down to 0.22 s, and no variance.
 /// 22 = the route is checked by a probe on the warm loop instead of by someone's
 ///     request, and a burst of in-flight failures no longer lengthens the bench.
-pub const RELAY_VERSION: u32 = 22;
+/// 23 = every child process it shells out to is bounded, so a hung helper can no
+///     longer stop it dead.
+pub const RELAY_VERSION: u32 = 23;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.

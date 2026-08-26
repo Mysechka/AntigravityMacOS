@@ -1,6 +1,8 @@
 use std::env;
 use std::io::{self, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Suppresses the console Windows would otherwise create for a console
 /// subsystem child.
@@ -23,12 +25,79 @@ pub fn no_window(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// Longest any single PowerShell call may take before it is killed.
+///
+/// There has to be one. `Command::output()` waits forever, and the DNS work runs
+/// through `Add-DnsClientNrptRule` and friends, which are CIM cmdlets and
+/// therefore go through WMI - a service that on some machines simply stops
+/// answering. One of those and the whole program stops on a printed line with no
+/// way out, which is what users reported as an eternal hang at "Патч для Google
+/// серверов..." while the same build was fine on other machines. Generous, since
+/// these cmdlets take a second or two normally, and a slow machine must not lose
+/// its rules to an impatient limit.
+const PS_LIMIT: Duration = Duration::from_secs(60);
+
 /// Runs a PowerShell snippet and hands back the raw output. Shared by the DNS
 /// and routing code, which is all cmdlet-driven.
+///
+/// `None` on failure *or* timeout: every caller already treats that as "this
+/// step did not happen", which is the right answer for a hung WMI too.
 pub fn powershell(script: &str) -> Option<std::process::Output> {
+    powershell_within(script, PS_LIMIT)
+}
+
+/// The same, with the limit given explicitly so the timeout itself is testable
+/// without waiting a minute for it.
+fn powershell_within(script: &str, limit: Duration) -> Option<std::process::Output> {
     let mut cmd = Command::new("powershell");
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    no_window(&mut cmd).output().ok()
+    bounded_output(no_window(&mut cmd), limit)
+}
+
+/// Runs a prepared command and gives up on it after `limit`.
+///
+/// Every helper this tool shells out to can hang - `netsh` and `tasklist` no
+/// less than PowerShell - and `Command::output()` has no way to stop waiting.
+/// Anything on a path a user is watching should come through here.
+pub fn bounded_output(cmd: &mut Command, limit: Duration) -> Option<std::process::Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+
+    // Drained on threads rather than after waiting: a child that fills its pipe
+    // blocks on the write, so polling for exit without reading would deadlock on
+    // exactly the long outputs most worth having.
+    let mut out = child.stdout.take().map(drain);
+    let mut err = child.stderr.take().map(drain);
+
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            // Killed, or unkillable and abandoned - either way this call is over
+            // and the caller gets the same `None` a failure would give it.
+            _ => {
+                child.kill().ok();
+                child.wait().ok();
+                return None;
+            }
+        }
+    };
+
+    Some(std::process::Output {
+        status,
+        stdout: out.take().and_then(|h| h.join().ok()).unwrap_or_default(),
+        stderr: err.take().and_then(|h| h.join().ok()).unwrap_or_default(),
+    })
+}
+
+/// Reads a pipe to end-of-file on its own thread.
+fn drain<R: std::io::Read + Send + 'static>(mut pipe: R) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut pipe, &mut buf).ok();
+        buf
+    })
 }
 
 pub fn clear_screen() {
@@ -145,6 +214,44 @@ pub fn is_admin() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hang users reported. `Command::output()` waits forever, and the DNS
+    /// step drives CIM cmdlets, i.e. WMI - which on some machines stops
+    /// answering. There is no output to see and no key to press: the program
+    /// simply stops on a printed line. A limit is what makes that a failed step
+    /// instead of a dead program.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_powershell_call_that_never_returns_is_given_up_on() {
+        let started = Instant::now();
+        let out = powershell_within("Start-Sleep -Seconds 60", Duration::from_secs(2));
+        assert!(out.is_none(), "a hung call must not come back with output");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "gave up after {:?}, which is not a limit",
+            started.elapsed()
+        );
+    }
+
+    /// The limit is worth nothing if the rewrite that added it broke the normal
+    /// path: every DNS rule this tool installs is read back through here.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn output_and_exit_status_still_come_back_intact() {
+        let out = powershell("Write-Output 'marker-42'").expect("powershell ran");
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("marker-42"),
+            "stdout was {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let failed = powershell("exit 3").expect("powershell ran");
+        assert!(
+            !failed.status.success(),
+            "a non-zero exit must not read as ok"
+        );
+    }
 
     /// Reproduces the relay's situation - a process with no console of its own -
     /// and checks what a spawned helper gets.

@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::dns_forwarder;
-use crate::utils::{no_window, powershell};
+use crate::utils::{bounded_output, no_window, powershell};
 
 // Keeping the DNS relay alive across reboots.
 //
@@ -58,10 +58,15 @@ pub fn is_enabled() -> bool {
     })
 }
 
+/// Limit for the small helpers here (`tasklist`, `taskkill`). Short, because
+/// they answer in milliseconds when they answer at all - and this runs on the
+/// path a user is watching.
+const HELPER_LIMIT: Duration = Duration::from_secs(15);
+
 pub fn is_running() -> bool {
     let mut cmd = Command::new("tasklist");
     cmd.args(["/FI", &format!("IMAGENAME eq {}", EXE_NAME), "/NH"]);
-    no_window(&mut cmd).output().map_or(false, |o| {
+    bounded_output(no_window(&mut cmd), HELPER_LIMIT).map_or(false, |o| {
         String::from_utf8_lossy(&o.stdout).contains(EXE_NAME)
     })
 }
@@ -77,7 +82,7 @@ pub fn is_running() -> bool {
 fn stop_process() {
     let mut cmd = Command::new("taskkill");
     cmd.args(["/F", "/IM", EXE_NAME]);
-    no_window(&mut cmd).output().ok();
+    bounded_output(no_window(&mut cmd), HELPER_LIMIT);
 
     for _ in 0..STOP_WAIT_TRIES {
         if !is_running() {

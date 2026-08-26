@@ -1,12 +1,13 @@
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::background;
 use crate::dns_forwarder;
 use crate::egress::{self, Egress};
 use crate::hosts_pin;
 use crate::resolvers;
-use crate::utils::{no_window, powershell};
+use crate::utils::{bounded_output, no_window, powershell};
 
 // NRPT-based selective DNS routing. Only the exact hostnames that Antigravity
 // actually talks to AND that the upstream resolver actually proxies are routed
@@ -112,7 +113,9 @@ fn set_ipv4_precedence(precedence: &str) {
         precedence,
         "4",
     ]);
-    no_window(&mut cmd).output().ok();
+    // Bounded like everything else on this path: `netsh` is a child process and
+    // a child process can stop answering.
+    bounded_output(no_window(&mut cmd), HELPER_LIMIT);
 }
 
 /// Restores the default IPv4/IPv6 precedence, but only if the current value is
@@ -254,6 +257,9 @@ pub struct DnsOutcome {
     pub pin_error: Option<String>,
     /// Names another tool was routing that this run claimed.
     pub taken_over: Vec<String>,
+    /// True when the probe budget ran out and the remaining names were given the
+    /// full provider list instead of a measured one.
+    pub probe_gave_up: bool,
 }
 
 /// Takes our namespaces away from any other tool's NRPT rule, and reports what
@@ -360,6 +366,33 @@ fn pin_substituted_hosts(namespaces: &[&str], if_index: u32) -> Result<Vec<Strin
 
 /// `include_gemini` additionally routes the AI Studio API-key page, which is
 /// only relevant to the Gemini CLI flow.
+/// One character of progress on the caller's line.
+fn tick() {
+    use std::io::Write;
+    print!(".");
+    std::io::stdout().flush().ok();
+}
+
+/// Longest the whole rule-building probe may take.
+///
+/// There has to be a bound. `substituting_addrs` asks every provider about every
+/// name over UDP/53, and `ask_provider` walks a provider's addresses one at a
+/// time at `QUERY_TIMEOUT` each; where those queries are simply dropped - a
+/// corporate firewall, some VPN configurations - the arithmetic reaches minutes,
+/// all of it behind one printed line with nothing moving. That is what users
+/// reported as an eternal hang at "Патч для Google серверов...".
+///
+/// Past this, the remaining names get the full provider list - the same list a
+/// name nobody substitutes gets anyway. The cost is that the fallback may then
+/// hold a provider that returns genuine Google for that name (I22), which is a
+/// rule that leaks when the relay is slow. A leak that degrades beats a hang
+/// that does not end, and the relay is still listed first.
+const PROBE_BUDGET: Duration = Duration::from_secs(25);
+
+/// Limit for the small helpers here (`netsh`). Short, because they answer in
+/// milliseconds when they answer at all.
+const HELPER_LIMIT: Duration = Duration::from_secs(15);
+
 pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
     // Remove any of our previous rules to keep a clean idempotent state.
     remove_dns_nrpt();
@@ -382,9 +415,21 @@ pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
     // The probe leaves through the ISP interface so a tunnel does not hide the
     // substitution.
     let probe_if = egress.as_ref().map(|e| e.if_index).unwrap_or(0);
+    let probe_until = Instant::now() + PROBE_BUDGET;
+    let mut probe_gave_up = false;
     let mut adds = String::new();
     for (i, name) in namespaces.iter().enumerate() {
-        let servers = nameservers_for(name, via_relay, probe_if);
+        let servers = if Instant::now() < probe_until {
+            // A dot per name, because the probing below is network-bound and the
+            // caller has already printed its label: without this the step is a
+            // motionless line for as long as the queries take, which is what an
+            // eternal hang looks like from the outside.
+            tick();
+            nameservers_for(name, via_relay, probe_if)
+        } else {
+            probe_gave_up = true;
+            assemble_nameservers(via_relay, &[])
+        };
         adds.push_str(&format!(
             "try {{ Add-DnsClientNrptRule -Namespace '{name}' -NameServers @({ns}) \
                -Comment '{tag}' -DisplayName 'AG Unlocker {canary} {token} {i}' -ErrorAction Stop }} \
@@ -450,6 +495,7 @@ pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
         pinned,
         pin_error,
         taken_over,
+        probe_gave_up,
     })
 }
 
@@ -458,6 +504,15 @@ pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
 /// the rest a no-op for that name, silently.
 pub fn outcome_note(o: &DnsOutcome) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
+
+    if o.probe_gave_up {
+        lines.push(
+            "  \x1b[33mПроверка DNS-провайдеров не уложилась в отведённое время —\n  \
+             правила записаны по общему списку. Обычно это значит, что запросы\n  \
+             к DNS блокирует сеть или VPN.\x1b[0m\x1b[92m"
+                .to_string(),
+        );
+    }
 
     if !o.taken_over.is_empty() {
         lines.push(format!(
