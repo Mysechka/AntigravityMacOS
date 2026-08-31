@@ -1,0 +1,6 @@
+# The Linux launcher assets MUST stay LF. Without this, a Windows checkout with
+# core.autocrlf=true rewrites them to CRLF, build_rust.py packs the CRLF copies
+# into the Linux bundle, and the `#!/usr/bin/env bash^M` shebang fails on Linux.
+*.sh text eol=lf
+*.desktop text eol=lf
+linux/README.md text eol=lf

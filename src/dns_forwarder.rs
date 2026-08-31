@@ -81,7 +81,7 @@ pub const LISTEN_PORT: u16 = 53;
 ///     request, and a burst of in-flight failures no longer lengthens the bench.
 /// 23 = every child process it shells out to is bounded, so a hung helper can no
 ///     longer stop it dead.
-pub const RELAY_VERSION: u32 = 25;
+pub const RELAY_VERSION: u32 = 26;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -126,6 +126,16 @@ const EGRESS_TTL: Duration = Duration::from_secs(30 * 60);
 /// the network not being up yet at logon - but not zero, or a machine with no
 /// physical egress at all would spawn a probe per query.
 const EGRESS_RETRY: Duration = Duration::from_secs(30);
+/// How often the relay re-asks whether a tunnel is carrying the machine.
+///
+/// Its own clock, and deliberately far shorter than `EGRESS_TTL`: an interface
+/// index changes when hardware does, but a VPN is something the user toggles
+/// mid-session, and that answer decides whether the relay substitutes at all
+/// (G26). Costs one PowerShell spawn per interval and never runs on the query
+/// path - a client waits on nothing here. Four minutes rather than fifteen
+/// seconds because being late merely means a few minutes of the old, slightly
+/// longer route; it breaks nothing.
+const VPN_CHECK_EVERY: Duration = Duration::from_secs(4 * 60);
 const LOG_LIMIT_BYTES: u64 = 64 * 1024;
 
 /// Interface index, when it was learned, and how long that answer is good for.
@@ -134,8 +144,24 @@ static EGRESS_CACHE: Mutex<Option<(u32, Instant, Duration)>> = Mutex::new(None);
 /// The log lives under the user profile, not next to the exe: the relay runs
 /// unelevated, and the directory an administrator installed it into is not
 /// writable for it.
+#[cfg(target_os = "windows")]
 pub fn log_dir() -> PathBuf {
     PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("AGUnlocker")
+}
+
+/// On Linux the per-user state dir follows the XDG base-dir spec
+/// (`~/.local/share/agunlocker`), which is also where the own-proxy config and
+/// any relay log will live once that layer is ported.
+#[cfg(not(target_os = "windows"))]
+pub fn log_dir() -> PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{}/.local/share", home)
+        });
+    PathBuf::from(base).join("agunlocker")
 }
 
 pub fn log_path() -> PathBuf {
@@ -318,7 +344,35 @@ fn warm_forever() {
     let mut since_probe = PROBE_HEALTHY_EVERY;
     let mut since_upstream = PROBE_HEALTHY_EVERY;
     let mut since_exits = PROBE_HEALTHY_EVERY;
+    let mut since_vpn = VPN_CHECK_EVERY;
     loop {
+        // First, because everything below depends on it: with a tunnel up the
+        // relay stops substituting and answers as the tunnel's own resolver
+        // would. The rules cannot be removed from here - the task runs at
+        // `RunLevel Limited` and NRPT needs an administrator - so the relay
+        // changes what it *answers* instead, which needs no privilege and
+        // reaches the same place. Menu 1 removes the rules outright on the next
+        // elevated run (`dns::refresh_pinned_hosts`).
+        if since_vpn >= VPN_CHECK_EVERY {
+            let up = egress::detect().is_some_and(|e| e.vpn_active);
+            if up != resolvers::vpn_is_active() {
+                log(&format!(
+                    "VPN {} — {}",
+                    if up {
+                        "поднят"
+                    } else {
+                        "отключён"
+                    },
+                    if up {
+                        "подмена выключена, DNS идёт как настроил VPN"
+                    } else {
+                        "подмена снова включена"
+                    }
+                ));
+            }
+            resolvers::set_vpn_active(up);
+            since_vpn = Duration::ZERO;
+        }
         let egress = isp_interface();
         resolvers::warm(dns::core_namespaces(), egress);
         // Checked on our own time rather than with someone's request. While the
@@ -354,6 +408,7 @@ fn warm_forever() {
         since_probe += WARM_EVERY;
         since_upstream += WARM_EVERY;
         since_exits += WARM_EVERY;
+        since_vpn += WARM_EVERY;
     }
 }
 

@@ -145,6 +145,144 @@ def compress_exe_inplace(exe_path):
         print("[INFO] exe сжат UPX.")
 
 
+# Linux build is produced by driving a WSL distro that has a Rust toolchain, so a
+# single `python build_rust.py` on Windows yields both the .exe and the Linux
+# bundle. Best-effort: if WSL or cargo is missing the Windows build still ships.
+PREFERRED_WSL_DISTROS = ("Ubuntu-26.04", "Ubuntu", "Ubuntu-24.04", "Ubuntu-22.04")
+
+
+def _wsl_run(distro, bash_cmd, capture=True):
+    """Runs a bash command inside a WSL distro (login shell, so ~/.cargo/env is
+    reachable via the explicit source below). Returns CompletedProcess."""
+    args = ["wsl.exe", "-d", distro, "--", "bash", "-lc", bash_cmd]
+    return subprocess.run(
+        args,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+        text=True, encoding="utf-8", errors="replace",
+    )
+
+
+def find_wsl_distro():
+    """The first installed WSL distro that has cargo on PATH (after sourcing the
+    rustup env). None if WSL is absent or no distro can build."""
+    try:
+        listing = subprocess.run(
+            ["wsl.exe", "-l", "-q"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-16-le", errors="replace",
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not listing:
+        return None
+    installed = [d.strip() for d in listing.splitlines() if d.strip()]
+    # Preferred names first, then whatever else is installed.
+    ordered = [d for d in PREFERRED_WSL_DISTROS if d in installed]
+    ordered += [d for d in installed if d not in ordered]
+    for distro in ordered:
+        probe = _wsl_run(distro, '. "$HOME/.cargo/env" 2>/dev/null; command -v cargo >/dev/null && echo OK')
+        if probe.returncode == 0 and "OK" in (probe.stdout or ""):
+            return distro
+    return None
+
+
+def _win_to_wsl_path(win_path):
+    """D:\\a\\b -> /mnt/d/a/b, without needing wslpath."""
+    p = os.path.abspath(win_path)
+    drive, rest = os.path.splitdrive(p)
+    rest = rest.replace("\\", "/")
+    return "/mnt/%s%s" % (drive.rstrip(":").lower(), rest)
+
+
+def build_linux_bundle(version):
+    """Builds the Linux ELF in WSL and assembles release/AG_<ver>_linux/ (+ .tar.gz)
+    with the double-click launcher assets. Best-effort; returns the bundle dir or
+    None. Never raises - the Windows build must not depend on it."""
+    import shutil
+    import tarfile
+
+    try:
+        distro = find_wsl_distro()
+        if not distro:
+            print("[i] Linux-сборка пропущена: не найден WSL-дистрибутив с cargo "
+                  "(установите rustup в WSL: 'curl https://sh.rustup.rs -sSf | sh').")
+            return None
+        print(f"[INFO] Сборка Linux-версии в WSL ({distro})...")
+
+        repo_wsl = _win_to_wsl_path(os.getcwd())
+        # Separate target dir so it never collides with the Windows target/.
+        build_cmd = (
+            'set -e; . "$HOME/.cargo/env"; cd "%s"; '
+            "cargo build --release --bin ag_unlocker --target-dir target-linux 2>&1 | tail -3"
+            % repo_wsl
+        )
+        res = _wsl_run(distro, build_cmd, capture=True)
+        if res.stdout:
+            print(res.stdout.rstrip())
+        if res.returncode != 0:
+            print("[WARNING] Linux-сборка не удалась (см. вывод выше) - отгружён только .exe.")
+            return None
+
+        elf = os.path.join("target-linux", "release", "ag_unlocker")
+        if not os.path.exists(elf):
+            print(f"[WARNING] ELF не найден по пути {elf} - Linux-бандл не собран.")
+            return None
+
+        bundle = os.path.abspath(os.path.join("release", f"AG_{version}_linux"))
+        if os.path.exists(bundle):
+            shutil.rmtree(bundle, ignore_errors=True)
+        os.makedirs(bundle, exist_ok=True)
+
+        # The ELF, plus the launcher assets from linux/.
+        shutil.copy2(elf, os.path.join(bundle, "ag_unlocker"))
+        for name in ("launch.sh", "install.sh", "Antigravity-Unlocker.desktop", "README.md"):
+            src = os.path.join("linux", name)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(bundle, name))
+
+        # Best-effort icon: convert icon.ico -> icon.png if Pillow is present.
+        try:
+            from PIL import Image
+            ico = "icon.ico"
+            if os.path.exists(ico):
+                img = Image.open(ico)
+                # Largest frame for a crisp menu icon.
+                if hasattr(img, "n_frames") and img.n_frames > 1:
+                    best, best_area = 0, 0
+                    for i in range(img.n_frames):
+                        img.seek(i)
+                        area = img.size[0] * img.size[1]
+                        if area > best_area:
+                            best, best_area = i, area
+                    img.seek(best)
+                img.convert("RGBA").save(os.path.join(bundle, "icon.png"))
+        except Exception:
+            pass  # Icon is cosmetic; the .desktop falls back to a theme icon.
+
+        # A .tar.gz for easy transfer to the VM, with the exec bits preserved.
+        tar_path = bundle + ".tar.gz"
+        if os.path.exists(tar_path):
+            os.remove(tar_path)
+
+        def _exec_bits(tarinfo):
+            base = os.path.basename(tarinfo.name)
+            if base in ("ag_unlocker", "launch.sh", "install.sh") or base.endswith(".desktop"):
+                tarinfo.mode = 0o755
+            return tarinfo
+
+        with tarfile.open(tar_path, "w:gz") as tar:
+            tar.add(bundle, arcname=f"AG_{version}_linux", filter=_exec_bits)
+
+        elf_size = os.path.getsize(os.path.join(bundle, "ag_unlocker")) // 1024
+        print(f"[УСПЕХ] Linux-бандл: {bundle} (ELF {elf_size} КБ)")
+        print(f"        Архив для переноса на машину: {tar_path}")
+        return bundle
+    except Exception as e:
+        print(f"[WARNING] Linux-сборка пропущена из-за ошибки: {e}")
+        return None
+
+
 def read_base_secret(auth_rs_path):
     """Reads the committed base secret straight from src\\auth.rs, so the source
     is the single source of truth for both the binary and the key generator."""
@@ -161,7 +299,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.10.0_3"
+    VERSION = "2.11.0_1"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
@@ -481,6 +619,10 @@ if __name__ == "__main__":
         print(f"    Записано в {ledger}. Проверить любой файл/бинарник:")
         print(f"    python tools\\canary_check.py <путь>")
 
+        # Linux bundle, built via WSL alongside the exe. Best-effort: a machine
+        # without WSL/cargo still ships the Windows build above.
+        build_linux_bundle(version)
+
         if is_owner:
             print(f"Ваш генератор ключей для этой версии: {dist_keygen_path}")
             print(f"\n[i] Ключи привязаны к версии {cargo_version}: на следующем релизе")
@@ -501,6 +643,13 @@ if __name__ == "__main__":
         print("\n[INFO] Очистка временных файлов сборки (cargo clean)...")
         try:
             subprocess.run(["cargo", "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        # The Linux build uses a separate target dir (target-linux) so it never
+        # collides with the Windows one; remove it too.
+        try:
+            import shutil
+            shutil.rmtree("target-linux", ignore_errors=True)
         except Exception:
             pass
 

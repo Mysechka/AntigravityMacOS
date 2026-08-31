@@ -231,6 +231,7 @@ pub fn without_addrs(reply: &[u8], drop: &[IpAddr]) -> Option<Vec<u8>> {
     let question_end = i;
 
     let mut kept: Vec<(usize, usize)> = Vec::new();
+    let mut kept_addrs = 0usize;
     let mut removed = 0usize;
     for _ in 0..answers {
         let start = i;
@@ -262,14 +263,27 @@ pub fn without_addrs(reply: &[u8], drop: &[IpAddr]) -> Option<Vec<u8>> {
         if addr.is_some_and(|a| drop.contains(&a)) {
             removed += 1;
         } else {
+            if addr.is_some() {
+                kept_addrs += 1;
+            }
             kept.push((start, end));
         }
         i = end;
     }
 
-    // Nothing to do, or everything would go: an empty answer is worse than a
-    // slow one, because the client then has nothing to fall through to.
-    if removed == 0 || kept.is_empty() {
+    // Nothing to do, or every *address* would go: an answer with no address is
+    // worse than a slow one, because the client then has nothing to fall
+    // through to.
+    //
+    // Counted in addresses, not records. It used to ask `kept.is_empty()`, and
+    // those two are the same question only while every answer record is an
+    // address - which was true of every substitution in the pool until comss
+    // started answering `cloudcode-pa` with a CNAME followed by four A records.
+    // Cut all four and one record survives, so the record-shaped guard let it
+    // through and produced a reply with ANCOUNT=1, a lone CNAME and no address
+    // at all: exactly the empty answer this refuses to make, wearing a shape it
+    // could not see. It bit the moment `cloudcode-pa` became the primary name.
+    if removed == 0 || kept_addrs == 0 {
         return None;
     }
     // The tail is the OPT record, if the reply carried one. Only a root name is
@@ -606,6 +620,38 @@ mod tests {
     fn removing_everything_is_refused() {
         let msg = reply_with(9, &[[1, 1, 1, 1]], false);
         assert!(without_addrs(&msg, &[v4("1.1.1.1")]).is_none());
+    }
+
+    /// The same rule, in the shape that got past it.
+    ///
+    /// comss answers `cloudcode-pa` with a CNAME and four A records. Cut all
+    /// four - which is what happens when every proxy address refuses the SNI -
+    /// and a record still survives, so a guard phrased as "did any *record*
+    /// remain" said yes and produced an answer with no address in it. The guard
+    /// counts addresses now, so this shape is refused like any other.
+    #[test]
+    fn removing_every_address_is_refused_even_when_a_cname_survives() {
+        let mut b = vec![];
+        b.extend_from_slice(&9u16.to_be_bytes());
+        // QDCOUNT 1, ANCOUNT 3 (CNAME + two A), no authority, no additional.
+        b.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x03, 0, 0, 0, 0]);
+        b.extend_from_slice(&[1, b'a', 0]); // question "a."
+        b.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        // CNAME "a." -> "b.", name compressed back to the question.
+        b.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0, 0, 0, 60, 0, 3]);
+        b.extend_from_slice(&[1, b'b', 0]);
+        for last in [1u8, 2u8] {
+            b.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4]);
+            b.extend_from_slice(&[10, 0, 0, last]);
+        }
+
+        assert_eq!(answer_addrs(&b), vec![v4("10.0.0.1"), v4("10.0.0.2")]);
+        // Both addresses dead -> refuse, rather than leave a lone CNAME.
+        assert!(without_addrs(&b, &[v4("10.0.0.1"), v4("10.0.0.2")]).is_none());
+        // One dead is still a normal edit, and the CNAME must survive it.
+        let out = without_addrs(&b, &[v4("10.0.0.1")]).expect("rewritten");
+        assert_eq!(answer_addrs(&out), vec![v4("10.0.0.2")]);
+        assert_eq!(u16::from_be_bytes([out[6], out[7]]), 2, "CNAME + one A");
     }
 
     #[test]

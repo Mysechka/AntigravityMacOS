@@ -48,9 +48,6 @@ pub enum Outcome {
     Applied,
     /// Already pointing at the right host.
     AlreadySet,
-    /// This build has no such setting - a future IDE may rename or drop it, and
-    /// writing a key nothing reads would look like success.
-    Unsupported,
 }
 
 /// Where the IDE keeps its user settings.
@@ -66,23 +63,20 @@ pub fn ide_settings_path(install: &Path) -> Option<PathBuf> {
         .get(1)?
         .as_str()
         .to_string();
-    let appdata = std::env::var("APPDATA").ok()?;
-    Some(
-        PathBuf::from(appdata)
-            .join(name)
-            .join("User")
-            .join("settings.json"),
-    )
-}
-
-/// True when this IDE build actually reads the override.
-fn build_reads_the_setting(install: &Path) -> bool {
-    let main_js = install
-        .join("resources")
-        .join("app")
-        .join("out")
-        .join("main.js");
-    fs::read_to_string(main_js).map_or(false, |src| src.contains(IDE_SETTING))
+    // The user-config root is `%APPDATA%` on Windows and `~/.config` on Linux -
+    // the same VS Code layout underneath (`<root>/<nameShort>/User/settings.json`).
+    #[cfg(target_os = "windows")]
+    let root = PathBuf::from(std::env::var("APPDATA").ok()?);
+    #[cfg(not(target_os = "windows"))]
+    let root = {
+        // An empty XDG_CONFIG_HOME (elevation can pass it through blank) is "unset",
+        // not a relative root - fall back to ~/.config in that case.
+        match std::env::var("XDG_CONFIG_HOME") {
+            Ok(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
+            _ => PathBuf::from(std::env::var("HOME").ok()?).join(".config"),
+        }
+    };
+    Some(root.join(name).join("User").join("settings.json"))
 }
 
 /// Rewrites `key` to `value`, leaving every other byte of the file alone.
@@ -91,6 +85,13 @@ fn build_reads_the_setting(install: &Path) -> bool {
 /// is the user's, not ours. Parsing and re-serialising would silently drop
 /// their comments and reorder their keys, so this edits the text in place, the
 /// same rule `hosts_pin` follows for the hosts file.
+///
+/// Unused since 2.11.0 removed the endpoint override (D11); kept because it is
+/// the write half of the pair `remove_key` belongs to, its eight tests are what
+/// pin that JSONC discipline (I18), and restoring an override - or writing any
+/// other IDE setting - would otherwise start by rewriting it from scratch.
+/// Delete it if a release passes with nothing needing to write a settings key.
+#[allow(dead_code)]
 fn upsert_key(text: &str, key: &str, value: &str) -> Result<String, String> {
     let existing = Regex::new(&format!(r#""{}"\s*:\s*"[^"]*""#, regex::escape(key)))
         .map_err(|_| "неверный шаблон настройки".to_string())?;
@@ -136,33 +137,21 @@ fn remove_key(text: &str, key: &str) -> Result<String, String> {
     Ok(alone.replace(text, "").into_owned())
 }
 
-/// Points this IDE install at the endpoint that still resolves to a proxy.
-pub fn apply_ide(install: &Path) -> Result<Outcome, String> {
-    if !build_reads_the_setting(install) {
-        return Ok(Outcome::Unsupported);
-    }
-    let path = ide_settings_path(install)
-        .ok_or_else(|| "не удалось определить папку настроек IDE".to_string())?;
+// `apply_ide`/`apply_cli` were deleted in 2.11.0 together with the policy they
+// served: the client is no longer pushed onto `daily-cloudcode-pa`, because the
+// host it picks for itself is routed now (see `main::process_install`). The two
+// `remove_*` below stay, and are called from menu 1 as well as the undo paths -
+// a machine patched by an earlier build still carries the override, and nothing
+// else would ever take it back off.
 
-    // A missing file is normal on a fresh install; an unreadable one is not.
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("не прочитать {}: {}", path.display(), e)),
-    };
-    if text.contains(&format!("\"{}\": \"{}\"", IDE_SETTING, DAILY_ENDPOINT)) {
-        return Ok(Outcome::AlreadySet);
-    }
-
-    let updated = upsert_key(&text, IDE_SETTING, DAILY_ENDPOINT)?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("не создать {}: {}", dir.display(), e))?;
-    }
-    fs::write(&path, updated).map_err(|e| format!("не записать {}: {}", path.display(), e))?;
-    Ok(Outcome::Applied)
-}
-
-/// Undoes `apply_ide`. A file we never wrote to is left alone.
+/// Takes our override back out of the IDE's settings.
+///
+/// Scoped to **our** value, the same rule `remove_cli` follows. Before 2.11.0
+/// this stripped the key whatever it held, which was harmless while only we ever
+/// wrote it; now that menu 1 calls it on every run, a user who points
+/// `jetski.cloudCodeUrl` somewhere themselves would have it silently deleted on
+/// the next patch. Deleting somebody's own configuration is the worse of the two
+/// failures (G20), so a value we did not write is left alone.
 pub fn remove_ide(install: &Path) -> Result<(), String> {
     let Some(path) = ide_settings_path(install) else {
         return Ok(());
@@ -170,27 +159,11 @@ pub fn remove_ide(install: &Path) -> Result<(), String> {
     let Ok(text) = fs::read_to_string(&path) else {
         return Ok(());
     };
-    if !text.contains(IDE_SETTING) {
+    if !text.contains(DAILY_ENDPOINT) {
         return Ok(());
     }
     let updated = remove_key(&text, IDE_SETTING)?;
     fs::write(&path, updated).map_err(|e| format!("не записать {}: {}", path.display(), e))
-}
-
-/// Sets the CLI's endpoint variable for the current user.
-///
-/// Written through .NET rather than `setx`, which silently truncates a value at
-/// 1024 characters and would rewrite the rest of the environment block.
-pub fn apply_cli() -> Result<Outcome, String> {
-    if current_cli_endpoint().as_deref() == Some(DAILY_ENDPOINT) {
-        return Ok(Outcome::AlreadySet);
-    }
-    let script = format!(
-        "[Environment]::SetEnvironmentVariable('{}','{}','User')",
-        CLI_ENV_VAR, DAILY_ENDPOINT
-    );
-    powershell(&script).ok_or_else(|| "не удалось записать переменную среды".to_string())?;
-    Ok(Outcome::Applied)
 }
 
 /// Removes the variable, but only when it still holds the value we wrote: a
@@ -231,6 +204,7 @@ const NO_PROXY_VALUE: &str = "127.0.0.1,localhost,::1";
 /// into. That breadth is the cost of the design, and the reason the proxy
 /// tunnels everything it does not carry straight through instead of failing:
 /// anything else on the machine that picks the variable up keeps working.
+#[cfg(target_os = "windows")]
 pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
     if current_env(PROXY_ENV_VAR).as_deref() == Some(url) {
         return Ok(Outcome::AlreadySet);
@@ -245,8 +219,59 @@ pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
     Ok(Outcome::Applied)
 }
 
+/// The Linux path uses **two** mechanisms so the language server the IDE spawns
+/// sees the proxy: a `~/.config/environment.d` drop-in makes it survive a reboot,
+/// and `systemctl --user set-environment` sets it in the running user manager, so
+/// a freshly-launched app inherits it **without a full re-login** - the user only
+/// has to quit and reopen Antigravity. Lower-case aliases too, since Go reads
+/// `HTTPS_PROXY` but other tooling reads `https_proxy`.
+#[cfg(not(target_os = "windows"))]
+pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
+    use std::process::Command;
+    let path = environment_d_path()?;
+    let body = format!(
+        "# Antigravity Unlocker — гейт-хосты через локальный прокси. Удалите файл,\n\
+         # чтобы отключить.\n\
+         HTTPS_PROXY={u}\nhttps_proxy={u}\nNO_PROXY={np}\nno_proxy={np}\n",
+        u = url,
+        np = NO_PROXY_VALUE,
+    );
+    if fs::read_to_string(&path).ok().as_deref() == Some(body.as_str()) {
+        return Ok(Outcome::AlreadySet);
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("не создать {}: {}", dir.display(), e))?;
+    }
+    fs::write(&path, &body).map_err(|e| format!("не записать {}: {}", path.display(), e))?;
+    // Immediate effect for newly-launched apps in this session (best-effort).
+    for (k, v) in [
+        (PROXY_ENV_VAR, url),
+        ("https_proxy", url),
+        (NO_PROXY_ENV_VAR, NO_PROXY_VALUE),
+        ("no_proxy", NO_PROXY_VALUE),
+    ] {
+        Command::new("systemctl")
+            .args(["--user", "set-environment", &format!("{}={}", k, v)])
+            .status()
+            .ok();
+    }
+    Ok(Outcome::Applied)
+}
+
+/// `~/.config/environment.d/ag-unlocker.conf`, honouring `XDG_CONFIG_HOME`.
+#[cfg(not(target_os = "windows"))]
+fn environment_d_path() -> Result<PathBuf, String> {
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(x) if !x.is_empty() => PathBuf::from(x),
+        _ => PathBuf::from(std::env::var("HOME").map_err(|_| "HOME не задан".to_string())?)
+            .join(".config"),
+    };
+    Ok(base.join("environment.d").join("ag-unlocker.conf"))
+}
+
 /// Removes them, but only while they still hold what we wrote - a user may have
 /// a proxy of their own, and taking that away would be worse than any bug here.
+#[cfg(target_os = "windows")]
 pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
     // Every variable is judged and removed on its own, and nothing stops at the
     // first failure. A half-removed proxy is worse than either state: the value
@@ -274,6 +299,24 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
     } else {
         Err(trouble.join("; "))
     }
+}
+
+/// Linux: delete the `environment.d` drop-in and unset the live session vars.
+/// Only ever removes our own file, so a proxy the user set another way is left
+/// alone (the file path is ours by construction).
+#[cfg(not(target_os = "windows"))]
+pub fn remove_proxy(_url: &str, _ca_path: &str) -> Result<(), String> {
+    use std::process::Command;
+    if let Ok(path) = environment_d_path() {
+        let _ = fs::remove_file(&path);
+    }
+    for k in [PROXY_ENV_VAR, "https_proxy", NO_PROXY_ENV_VAR, "no_proxy"] {
+        Command::new("systemctl")
+            .args(["--user", "unset-environment", k])
+            .status()
+            .ok();
+    }
+    Ok(())
 }
 
 /// Whether an `HTTPS_PROXY` value is one this tool wrote.
@@ -320,7 +363,7 @@ pub fn clear_node_ca(ca_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-
+#[cfg(target_os = "windows")]
 fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
     let literal = match value {
         Some(v) => format!("'{}'", v),
@@ -334,6 +377,24 @@ fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// Persisting a per-user environment variable for GUI-launched processes on
+/// Linux has no single mechanism (systemd `environment.d`, `~/.profile`,
+/// `~/.pam_environment` all reach different launchers), so it is deferred with
+/// the proxy carrier that needs it. Removal is a trivial success - there is
+/// nothing of ours in a persistent store to take out - while a request to *set*
+/// one is refused honestly rather than silently doing nothing.
+#[cfg(not(target_os = "windows"))]
+fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
+    match value {
+        None => Ok(()),
+        Some(_) => Err(format!(
+            "{} на Linux пока не задаётся (нужен свой прокси-слой порта)",
+            name
+        )),
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn current_env(name: &str) -> Option<String> {
     let out = powershell(&format!(
         "[Environment]::GetEnvironmentVariable('{}','User')",
@@ -343,6 +404,15 @@ fn current_env(name: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// We manage no persistent user-env store on Linux yet, so there is nothing of
+/// ours to read back. `None` makes every "remove if it is still ours" guard a
+/// clean no-op.
+#[cfg(not(target_os = "windows"))]
+fn current_env(_name: &str) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "windows")]
 fn current_cli_endpoint() -> Option<String> {
     let out = powershell(&format!(
         "[Environment]::GetEnvironmentVariable('{}','User')",
@@ -350,6 +420,11 @@ fn current_cli_endpoint() -> Option<String> {
     ))?;
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn current_cli_endpoint() -> Option<String> {
+    None
 }
 
 #[cfg(test)]
@@ -372,7 +447,11 @@ mod tests {
             "127.0.0.1:53129",
             "https://127.0.0.1:53129",
         ] {
-            assert!(is_our_proxy_value(shape, url), "should be ours: {:?}", shape);
+            assert!(
+                is_our_proxy_value(shape, url),
+                "should be ours: {:?}",
+                shape
+            );
         }
     }
 
@@ -511,9 +590,11 @@ mod tests {
         assert!(!DAILY_ENDPOINT.contains("sandbox"));
     }
 
-    /// Against the real install: the two things unit tests cannot check are
-    /// whether the settings path resolves to the folder the IDE actually reads,
-    /// and whether this build still carries the setting at all.
+    /// Against the real install. It used to also assert that the build still
+    /// reads `jetski.cloudCodeUrl`; nothing writes that key since 2.11.0, so the
+    /// question left is the one `remove_ide` depends on - does the path resolve
+    /// to the folder the IDE actually reads, so an override left by an earlier
+    /// build is found and taken out.
     #[test]
     #[ignore = "needs a real Antigravity IDE install; run with --ignored"]
     fn finds_the_real_ide_settings_file() {
@@ -526,20 +607,10 @@ mod tests {
         }
         let path = ide_settings_path(&install).expect("settings path");
         println!("settings: {} (exists: {})", path.display(), path.exists());
-        println!(
-            "build reads {}: {}",
-            IDE_SETTING,
-            build_reads_the_setting(&install)
-        );
         assert!(
             path.ends_with("User\\settings.json"),
             "unexpected shape: {}",
             path.display()
-        );
-        assert!(
-            build_reads_the_setting(&install),
-            "this IDE build has no {} - the override would be a no-op",
-            IDE_SETTING
         );
     }
 }

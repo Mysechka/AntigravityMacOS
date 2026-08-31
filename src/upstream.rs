@@ -552,6 +552,56 @@ fn trace_through(up: &Upstream, host: &'static str) -> Option<(String, String)> 
     Some((field("ip=")?, field("loc=")?))
 }
 
+/// The machine's OWN egress, ip and Cloudflare's country for it, over the
+/// default route (no proxy). This is the P16 primitive: menu 1 uses it to tell
+/// the user whether their exit already lifts the gate, so the DNS layer is
+/// insurance rather than load-bearing (G26). Advisory only - it never decides
+/// what to install, because the 400 is invisible out of band and a permitted
+/// exit is inferred, not proven.
+///
+/// Same trace hosts and parsing as `exit_info`, just dialed directly. Bounded so
+/// a dead network cannot hang the menu.
+pub fn machine_exit() -> Option<(String, String)> {
+    TRACE_HOSTS.iter().find_map(|h| trace_direct(h))
+}
+
+fn trace_direct(host: &'static str) -> Option<(String, String)> {
+    let addr = (host, 443u16);
+    let mut sock = std::net::TcpStream::connect(addr).ok()?;
+    sock.set_read_timeout(Some(PROBE_BUDGET)).ok();
+    sock.set_write_timeout(Some(PROBE_BUDGET)).ok();
+    let name = ServerName::try_from(host).ok()?;
+    let mut tls = ClientConnection::new(crate::proxy::probe_config(), name).ok()?;
+    let mut stream = rustls::Stream::new(&mut tls, &mut sock);
+    stream
+        .write_all(
+            format!(
+                "GET /cdn-cgi/trace HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                host
+            )
+            .as_bytes(),
+        )
+        .ok()?;
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while let Ok(n) = stream.read(&mut chunk) {
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+        if body.len() > 8 * 1024 {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&body);
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+            .filter(|v| !v.is_empty())
+    };
+    Some((field("ip=")?, field("loc=")?))
+}
+
 /// Regions where a proxy is pointless, because they are the ones being blocked.
 /// Not a complete list and not meant to be - it exists to catch the common case
 /// of someone pointing this at a VPN that surfaces next door.
@@ -564,6 +614,17 @@ pub fn region_is_blocked(loc: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live: the P16 primitive reaches Cloudflare directly and reads the exit
+    /// country. Ignored (needs the network); the point is that the direct
+    /// rustls path works, not the value.
+    #[test]
+    #[ignore = "needs a live network; run with --ignored"]
+    fn machine_exit_reports_a_country() {
+        let (ip, loc) = machine_exit().expect("a trace");
+        println!("exit ip={} loc={}", ip, loc);
+        assert!(!ip.is_empty() && loc.len() == 2, "ip={} loc={}", ip, loc);
+    }
 
     #[test]
     fn reads_the_shapes_people_actually_paste() {

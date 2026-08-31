@@ -27,14 +27,24 @@ const AG_NRPT_TAG: &str = "AG_UNLOCKER_NRPT_V2";
 // stale (and much broader) rules behind.
 const AG_NRPT_LEGACY_TAGS: &[&str] = &["AG_UNLOCKER_NRPT"];
 
-// The only names that actually need unblock DNS, measured end-to-end:
-// `daily-cloudcode-pa` is the sole region-gated endpoint for the IDE (geohide
-// substitutes it; it carries the whole agentic flow), and `generativelanguage`
-// is kept for the Gemini CLI path. `cloudcode-pa` and `antigravity-unleash` were
-// dropped: nobody substitutes them (genuine everywhere), so a rule only leaked
-// DNS to a third party for zero benefit (N2). Everything else Antigravity talks
-// to - oauth2/www/play/accounts/jetski-webchannel - works on real Google.
+// The only names that actually need unblock DNS, measured end-to-end.
+//
+// `cloudcode-pa` is back (2026-08-30), and it is the one entry here whose
+// history matters. It was dropped under N2 because a 22-resolver sweep found
+// **nobody** substituting it (S9) - a rule for a name every provider answers
+// genuinely is pure DNS leakage. That premise died the moment a provider that
+// does substitute it was measured: dns-ai.ru answers 186.246.45.126, and that
+// address accepts the SNI and replies as Google's own frontend. N2 still holds
+// as written - do not add a name *nobody* substitutes - but it was never a rule
+// about this hostname, it was a rule about the measurement, and the measurement
+// changed. `antigravity-unleash` stays out: still genuine everywhere.
+//
+// `daily-cloudcode-pa` stays because it is the same service by another name and
+// two providers reach it; `generativelanguage` is the Gemini CLI path.
+// Everything else Antigravity talks to - oauth2/www/play/accounts and
+// jetski-webchannel - works on real Google and is deliberately not listed.
 const AG_NRPT_CORE: &[&str] = &[
+    "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
     "generativelanguage.googleapis.com",
 ];
@@ -134,6 +144,12 @@ fn restore_ipv4_precedence() {
     }
 }
 
+/// Linux has no NRPT and no relay installed yet, so there is nothing to remove;
+/// the undo menus must not spawn doomed helpers or error here.
+#[cfg(not(target_os = "windows"))]
+pub fn remove_dns_nrpt() {}
+
+#[cfg(target_os = "windows")]
 pub fn remove_dns_nrpt() {
     restore_ipv4_precedence();
     // The pinned addresses only exist to serve these rules, so they go together.
@@ -168,9 +184,18 @@ fn installed_namespaces() -> Vec<String> {
     }
 }
 
+/// No NRPT layer on Linux yet, so no rules are ever applied. Returning false
+/// keeps the "running without admin" advisory honest and stops `main()` probing
+/// PowerShell that is not there.
+#[cfg(not(target_os = "windows"))]
+pub fn is_nrpt_applied() -> bool {
+    false
+}
+
 /// True when every core namespace already has a rule. Extra rules (e.g. the
 /// Gemini-only namespace) do not make this false - they are still ours and are
 /// cleaned up together.
+#[cfg(target_os = "windows")]
 pub fn is_nrpt_applied() -> bool {
     if let Ok(cache) = NRPT_CACHE.lock() {
         if let Some(v) = *cache {
@@ -252,6 +277,9 @@ fn ps_string_list_owned(items: &[String]) -> String {
 /// forced the fallback path.
 pub struct DnsOutcome {
     pub vpn_active: bool,
+    /// True when a tunnel was up and this run therefore installed **no** rules
+    /// and left the machine resolving exactly as the VPN configured it.
+    pub stood_down_for_vpn: bool,
     pub via_relay: bool,
     pub pinned: Vec<String>,
     pub pin_error: Option<String>,
@@ -393,12 +421,55 @@ const PROBE_BUDGET: Duration = Duration::from_secs(25);
 /// milliseconds when they answer at all.
 const HELPER_LIMIT: Duration = Duration::from_secs(15);
 
+/// The DNS/NRPT layer is the last part of the Linux port (kb/patch.md). Until it
+/// lands, the binary/JS patch is what lifts the gate on a permitted exit, and
+/// this reports "not done" so the caller can say so rather than half-running the
+/// Windows path.
+#[cfg(not(target_os = "windows"))]
+pub fn setup_dns_nrpt_with(_include_gemini: bool) -> Result<DnsOutcome, String> {
+    Err("DNS-слой на Linux пока не портирован".to_string())
+}
+
+#[cfg(target_os = "windows")]
 pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
     // Remove any of our previous rules to keep a clean idempotent state.
     remove_dns_nrpt();
 
     let egress = egress::detect();
     let via_relay = background::is_enabled();
+
+    // A tunnel is up: install nothing and leave the machine resolving exactly as
+    // the VPN configured it (owner's call).
+    //
+    // The rules cannot help here and can only hurt. An NRPT rule *overrides* the
+    // VPN's own DNS for those names, so it takes a decision away from the thing
+    // the user deliberately turned on; and the answer it substitutes points at a
+    // provider's proxy, which the traffic then reaches **through** the tunnel -
+    // client -> tunnel -> proxy -> Google, a detour to reach what the tunnel
+    // already reaches directly. Worse, if the exit is in a permitted region the
+    // gate is already lifted by the tunnel alone (S25), so the whole layer is
+    // paying latency for nothing. Measured on a live machine: exit `loc=FI`,
+    // TLS to CloudCode 0.126 s direct, against a substituted address that adds a
+    // hop. G26.
+    //
+    // This is the counterpart to N3, not a contradiction of it: N3 says a tunnel
+    // *breaks* substitution (the provider geolocates the exit, not the user), and
+    // the answer used to be to dodge the tunnel for DNS. Dodging is still right
+    // when the exit is blocked, but the tool cannot tell a Finnish exit from a
+    // Russian one without asking, and the owner's instruction is unambiguous:
+    // with a VPN up, the VPN decides. `remove_dns_nrpt()` above has already taken
+    // ours off, which is the whole of the work.
+    if egress.as_ref().is_some_and(|e| e.vpn_active) {
+        return Ok(DnsOutcome {
+            vpn_active: true,
+            stood_down_for_vpn: true,
+            via_relay,
+            pinned: Vec::new(),
+            pin_error: None,
+            taken_over: Vec::new(),
+            probe_gave_up: false,
+        });
+    }
 
     let mut namespaces: Vec<&str> = AG_NRPT_CORE.to_vec();
     if include_gemini {
@@ -491,6 +562,7 @@ pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
 
     Ok(DnsOutcome {
         vpn_active: egress.as_ref().map_or(false, |e: &Egress| e.vpn_active),
+        stood_down_for_vpn: false,
         via_relay,
         pinned,
         pin_error,
@@ -504,6 +576,19 @@ pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
 /// the rest a no-op for that name, silently.
 pub fn outcome_note(o: &DnsOutcome) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
+
+    // Said first and on its own: nothing else in this function describes rules
+    // that were not written, and a user who sees no other note would reasonably
+    // assume the step silently failed.
+    if o.stood_down_for_vpn {
+        return Some(
+            "  Обнаружен активный VPN — правила DNS не создавались.\n  \
+             Запросы идут так, как их настраивает VPN. Если выход VPN\n  \
+             в разрешённом регионе, обход уже работает и без наших правил;\n  \
+             если нет — отключите VPN и запустите пункт 1 снова."
+                .to_string(),
+        );
+    }
 
     if o.probe_gave_up {
         lines.push(
@@ -569,12 +654,33 @@ fn fallback_note(o: &DnsOutcome) -> Option<String> {
     None
 }
 
-/// Re-reads the substituted addresses and rewrites the pinned block. The rules
-/// survive a reboot and follow the proxy as it rotates addresses; a static file
-/// cannot, so it is refreshed whenever the unlocker runs. A no-op without a
-/// tunnel, where the rules alone already do the job.
+/// Keeps the DNS layer honest about the network it woke up on. Runs on every
+/// elevated start of the unlocker.
+///
+/// Two jobs, and the first one is new: **a VPN that came up after the machine
+/// was patched takes the rules back off.** `setup_dns_nrpt_with` refuses to
+/// install them while a tunnel is up, but that only covers the machine's state
+/// at patch time; a user who connects a VPN afterwards would otherwise keep
+/// overriding their own resolver for three names indefinitely. Returns the
+/// machine to "whatever the VPN configured", which is the whole rule (G26).
+///
+/// The second is the older one: the pinned `hosts` block is a static copy of a
+/// TTL-60 answer, so it is rewritten while it is still the fallback in use, and
+/// dropped the moment it is not.
+/// Nothing is pinned on Linux yet (no NRPT, no relay), so there is nothing to
+/// refresh. A no-op keeps `main()`'s startup path clean.
+#[cfg(not(target_os = "windows"))]
+pub fn refresh_pinned_hosts() {}
+
+#[cfg(target_os = "windows")]
 pub fn refresh_pinned_hosts() {
     if !is_nrpt_applied() {
+        return;
+    }
+    if egress::detect().is_some_and(|e| e.vpn_active) {
+        // Takes the pinned block with it - `remove_dns_nrpt` owns both, because
+        // the addresses only ever existed to serve the rules.
+        remove_dns_nrpt();
         return;
     }
     // The relay resolves live, so a pinned block would only be a stale copy.
@@ -582,22 +688,35 @@ pub fn refresh_pinned_hosts() {
         hosts_pin::remove_entries().ok();
         return;
     }
-    match egress::detect() {
-        Some(eg) if eg.vpn_active => {
-            if pin_substituted_hosts(AG_NRPT_CORE, eg.if_index).is_ok() {
-                powershell("Clear-DnsClientCache -ErrorAction SilentlyContinue");
-            }
-        }
-        _ => {
-            hosts_pin::remove_entries().ok();
-        }
-    }
+    hosts_pin::remove_entries().ok();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// The stand-down is announced on its own and nothing else is printed with
+    /// it: a user who saw no note at all would reasonably read a step that wrote
+    /// no rules as a step that failed.
+    #[test]
+    fn a_vpn_stand_down_says_so_and_says_nothing_else() {
+        let o = DnsOutcome {
+            vpn_active: true,
+            stood_down_for_vpn: true,
+            via_relay: true,
+            pinned: Vec::new(),
+            pin_error: None,
+            taken_over: vec!["cloudcode-pa.googleapis.com (OTHER)".to_string()],
+            probe_gave_up: true,
+        };
+        let note = outcome_note(&o).expect("должно быть сообщение");
+        assert!(note.contains("VPN"), "{}", note);
+        assert!(note.contains("правила DNS не создавались"), "{}", note);
+        // The relay/probe/takeover lines belong to a run that wrote rules.
+        assert!(!note.contains("релей"), "{}", note);
+        assert!(!note.contains("Забраны правила"), "{}", note);
+    }
 
     #[test]
     fn a_foreign_rule_on_one_of_our_names_is_a_conflict() {
@@ -660,17 +779,36 @@ mod tests {
     }
 
     #[test]
-    fn a_name_nobody_substitutes_lists_every_provider() {
+    fn a_name_nobody_substitutes_lists_every_reachable_provider() {
         // antigravity-unleash is genuine everywhere - there is nothing to leak,
         // so all providers serve as plain resolvers behind the relay.
+        //
+        // "Every provider" means every provider Windows can be pointed at. A DoH
+        // provider has no UDP address by construction (see `resolvers::Transport`)
+        // and must stay out of the list even here, where the rule is at its most
+        // permissive: a nameserver that answers nothing is worse than one fewer
+        // fallback.
         let servers = assemble_nameservers(true, &[]);
         for p in resolvers::PROVIDERS {
-            assert!(
-                servers.iter().any(|s| s == p.v4[0]),
-                "{} missing from {:?}",
-                p.name,
-                servers
-            );
+            match p.v4.first() {
+                Some(first) => assert!(
+                    servers.iter().any(|s| s == first),
+                    "{} missing from {:?}",
+                    p.name,
+                    servers
+                ),
+                None => {
+                    if let resolvers::Transport::Doh(endpoint) = p.transport {
+                        for a in endpoint.addrs {
+                            assert!(
+                                !servers.iter().any(|s| s == a),
+                                "DoH address {} leaked into a nameserver list",
+                                a
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

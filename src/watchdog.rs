@@ -60,6 +60,13 @@ pub fn start() {
     thread::spawn(run);
 }
 
+/// Runs the watcher on the current thread, forever. This is the standalone
+/// `--watchdog` task's entry point: it has no relay loop to keep it alive, so it
+/// *is* the loop. Same body as `start`'s thread, no network of any kind.
+pub fn run_forever() {
+    run();
+}
+
 fn run() {
     log("start");
     let mut states: HashMap<PathBuf, FileState> = HashMap::new();

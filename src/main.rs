@@ -1,3 +1,13 @@
+// The Windows build is the shipping platform and is fully linted. The Linux port
+// is partial (phase 1: the client patch; the NRPT/relay/systemd layer is stubbed,
+// P7 phase 5), so a large Windows-only surface is legitimately dead code there.
+// Silence exactly that noise on non-Windows targets, and only there, so a real
+// dead symbol on Windows is still caught.
+#![cfg_attr(
+    not(target_os = "windows"),
+    allow(dead_code, unused_imports, unused_variables, unused_mut)
+)]
+
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -10,10 +20,12 @@ mod asar;
 mod auth;
 mod background;
 mod canary;
+#[cfg(target_os = "windows")]
 mod console_style;
 mod dns;
 mod dns_client;
 mod dns_forwarder;
+mod doh;
 mod egress;
 mod endpoint;
 mod health;
@@ -82,12 +94,23 @@ fn is_install_root(path: &Path) -> bool {
             return true;
         }
     }
-    if path.join("agy.exe").exists() {
+    // `is_file`, not `exists`: `%LOCALAPPDATA%\agy` is the CLI's *directory*, and
+    // an `exists()` check there made the parent-walk treat `%LOCALAPPDATA%` itself
+    // as an install root. A launcher/CLI is always a file.
+    if path.join("agy.exe").is_file() || path.join("agy").is_file() {
         return true;
     }
-    if path.join("Antigravity.exe").exists()
-        || path.join("Antigravity IDE.exe").exists()
-        || path.join("antigravity.exe").exists()
+    if path.join("Antigravity.exe").is_file()
+        || path.join("Antigravity IDE.exe").is_file()
+        || path.join("antigravity.exe").is_file()
+    {
+        return true;
+    }
+    // Linux/macOS launcher names (no extension).
+    #[cfg(not(target_os = "windows"))]
+    if path.join("antigravity").is_file()
+        || path.join("Antigravity").is_file()
+        || path.join("antigravity-ide").is_file()
     {
         return true;
     }
@@ -148,6 +171,7 @@ pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
 /// `find_all_installs` so the watchdog can enumerate installs without the
 /// PowerShell registry scan - spawning PowerShell on a timer inside the
 /// background relay would be both wasteful and a stray-window risk.
+#[cfg(target_os = "windows")]
 fn standard_install_candidates() -> Vec<PathBuf> {
     let local_appdata = env::var("LOCALAPPDATA").unwrap_or_default();
     let prog_files = env::var("PROGRAMFILES").unwrap_or_default();
@@ -171,6 +195,105 @@ fn standard_install_candidates() -> Vec<PathBuf> {
     ]
 }
 
+/// The Linux equivalents. Antigravity ships as an Electron/VS Code fork, which on
+/// Linux lands in one of the system prefixes (`.deb` → `/usr/share` or `/opt`;
+/// tarball → `/opt` or under the home dir) with the language server at
+/// `resources/app/extensions/antigravity/bin/`. The CLI keeps a per-user `agy`
+/// tree. Anything not covered here is reachable through menu 3 (manual path),
+/// which is why this list can stay short rather than scanning the whole disk.
+#[cfg(not(target_os = "windows"))]
+fn standard_install_candidates() -> Vec<PathBuf> {
+    let home = env::var("HOME").unwrap_or_default();
+    let mut v: Vec<PathBuf> = Vec::new();
+    // System-wide install roots, both capitalisations the packaging might use.
+    for base in ["/opt", "/usr/share", "/usr/lib", "/usr/local/share"] {
+        for name in [
+            "Antigravity",
+            "Antigravity IDE",
+            "antigravity",
+            "antigravity-ide",
+        ] {
+            v.push(PathBuf::from(base).join(name));
+        }
+    }
+    // Per-user installs (tarball / AppImage extraction / `agy` CLI).
+    if !home.is_empty() {
+        let h = PathBuf::from(&home);
+        v.push(h.join(".local/share/Antigravity"));
+        v.push(h.join(".local/share/Antigravity IDE"));
+        v.push(h.join("Antigravity"));
+        v.push(h.join("Antigravity IDE"));
+        // The `agy` CLI: measured at `~/.local/bin/agy` on a real install, so its
+        // bin dir is an install root in its own right (binary_targets scopes to
+        // `agy`/`language_server*`, so a shared bin dir patches only ours).
+        v.push(h.join(".local/bin"));
+        v.push(h.join(".agy/bin"));
+        v.push(h.join(".agy"));
+        v.push(h.join(".local/share/agy/bin"));
+    }
+    v
+}
+
+/// The directory holding the `agy` CLI, found via PATH first and then the common
+/// per-user/system bin dirs. Linux only; returns the dir (an install root once
+/// `agy` is in it), not the file.
+#[cfg(not(target_os = "windows"))]
+fn find_agy_dir() -> Option<PathBuf> {
+    let home = env::var("HOME").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(path) = env::var("PATH") {
+        dirs.extend(path.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
+    }
+    dirs.push(PathBuf::from(format!("{}/.local/bin", home)));
+    dirs.push(PathBuf::from(format!("{}/.agy/bin", home)));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs.push(PathBuf::from("/usr/bin"));
+    // Never a snap dir: `/snap/bin/agy` is a read-only wrapper, not the real
+    // binary - patching it always fails (no signature, read-only mount) and only
+    // produces a scary "signature not found". A snap CLI is out of scope; the
+    // native `~/.local/bin/agy` is what gets patched.
+    dirs.into_iter()
+        .find(|d| !is_snap_path(d) && d.join("agy").is_file())
+}
+
+/// True for a path served by snapd's read-only squashfs mounts, which cannot be
+/// patched in place.
+#[cfg(not(target_os = "windows"))]
+fn is_snap_path(p: &Path) -> bool {
+    p.starts_with("/snap") || p.starts_with("/var/lib/snapd")
+}
+
+/// Scans the usual Linux prefixes for any `*antigravity*` directory, so an
+/// install whose name is not hardcoded is still found - the analogue of the
+/// Windows registry scan. Returns candidate roots to be resolved.
+#[cfg(not(target_os = "windows"))]
+fn scan_antigravity_dirs() -> Vec<PathBuf> {
+    let home = env::var("HOME").unwrap_or_default();
+    let mut out = Vec::new();
+    let bases = [
+        "/opt".to_string(),
+        "/usr/share".to_string(),
+        "/usr/lib".to_string(),
+        "/usr/local/share".to_string(),
+        format!("{}/.local/share", home),
+    ];
+    for base in bases {
+        if let Ok(entries) = fs::read_dir(&base) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let hit = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.to_lowercase().contains("antigravity"));
+                if hit && p.is_dir() {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Resolves the standard install locations only - filesystem checks, no
 /// PowerShell. This is what the watchdog polls.
 pub fn discover_installs_fast() -> Vec<PathBuf> {
@@ -188,6 +311,17 @@ pub fn discover_installs_fast() -> Vec<PathBuf> {
 fn find_all_installs() -> Vec<PathBuf> {
     let mut installs = Vec::new();
     let mut candidates = standard_install_candidates();
+
+    // Linux: augment the fixed list with a scan of the usual prefixes for
+    // *antigravity* dirs and the `agy` CLI's bin dir, so an install we did not
+    // hardcode (or a CLI that lives on PATH) is still found.
+    #[cfg(not(target_os = "windows"))]
+    {
+        candidates.extend(scan_antigravity_dirs());
+        if let Some(agy_dir) = find_agy_dir() {
+            candidates.push(agy_dir);
+        }
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -215,6 +349,11 @@ fn find_all_installs() -> Vec<PathBuf> {
             }
         }
     }
+    // Never a snap: its squashfs is read-only, so a resolved install (or a symlink
+    // that resolved into one) could only ever fail to patch. Drop it here as well
+    // as in the CLI search, so nothing snap-served reaches the results.
+    #[cfg(not(target_os = "windows"))]
+    installs.retain(|p| !is_snap_path(p));
     installs
 }
 
@@ -292,9 +431,26 @@ fn process_install(install: &Path) -> Result<String, String> {
             // the extension patch is cosmetic next to the Language Server one.
             let _ = e;
         }
-        // Desktop already ships pointing at the daily host; only the IDE has to
-        // be told, and it has a supported setting for exactly that.
-        let _ = endpoint::apply_ide(install);
+        // The endpoint is deliberately NOT overridden any more (2.11.0).
+        //
+        // Pushing the client onto `daily-cloudcode-pa` was a workaround for one
+        // fact: nobody substituted `cloudcode-pa`, so the host Antigravity picks
+        // for itself had no route (S9/N15). A provider that substitutes it is now
+        // measured and first in the pool, so the workaround costs more than it
+        // buys - it is a user-visible setting in *their* settings.json that
+        // survives our revert paths only if they run one, and it pins a host
+        // choice Antigravity is entitled to make differently per build or
+        // account. Leave the host alone; route whichever one it asks for.
+        //
+        // Upgrade duty, same shape as `remove_legacy_ca` (I27): a machine
+        // patched by <= 2.10.x still carries the override, and leaving it would
+        // silently keep that machine on the old host. Menu 1 takes it back out.
+        if let Err(e) = endpoint::remove_ide(install) {
+            println!(
+                "  \x1b[33m[WARN] Прежний оверрайд эндпоинта не снят: {}\x1b[0m\x1b[92m",
+                e
+            );
+        }
         return Ok("Antigravity IDE".to_string());
     } else if desktop_js.exists() {
         let js_patched = patch_desktop(install, &desktop_js)?;
@@ -303,23 +459,20 @@ fn process_install(install: &Path) -> Result<String, String> {
             restore_pristine_asar(&resources)?;
         }
         return Ok("Antigravity Desktop".to_string());
-    } else if install.join("agy.exe").exists() {
+    } else if install.join("agy.exe").is_file() || install.join("agy").is_file() {
         if bin_summary.ok == 0 {
             return Err(binary_failure_message(&bin_summary));
         }
-        // The CLI has no settings file; it reads an environment variable.
-        match endpoint::apply_cli() {
-            Ok(endpoint::Outcome::AlreadySet) => {
-                println!("  [OK] Эндпоинт CloudCode — уже переключён")
-            }
-            Ok(_) => println!(
-                "  [OK] Эндпоинт CloudCode переключён ({} — нужен новый терминал)",
-                endpoint::CLI_ENV_VAR
-            ),
-            Err(e) => println!(
-                "  \x1b[33m[WARN] Эндпоинт не переключён: {}\x1b[0m\x1b[92m",
+        // Not overridden any more, for the reason spelled out in the IDE arm
+        // above; here the leftover is an environment variable rather than a
+        // settings key, and it outlives a reinstall, so taking it back out
+        // matters more, not less.
+        if let Err(e) = endpoint::remove_cli() {
+            println!(
+                "  \x1b[33m[WARN] Прежний {} не снят: {}\x1b[0m\x1b[92m",
+                endpoint::CLI_ENV_VAR,
                 e
-            ),
+            );
         }
         return Ok("Antigravity CLI".to_string());
     }
@@ -354,6 +507,40 @@ fn is_gemini_cli_installed() -> bool {
 /// Starts the background resolver and installs the NRPT rules. Order matters:
 /// the nameserver the rules point at depends on whether the relay is running,
 /// so it has to be up before they are written.
+#[cfg(not(target_os = "windows"))]
+fn apply_dns_patch(_include_gemini: bool) {
+    // Phase-2 region route (kb/patch.md): start the local CONNECT proxy as a
+    // systemd user unit and point the language server at it via HTTPS_PROXY. The
+    // proxy carries the gate hosts through a permitted-region exit, so the
+    // server-side 400 lifts (S25). No DNS, no root.
+    print!("\nЛокальный прокси-маршрут (обход ошибки 400)... ");
+    io::stdout().flush().ok();
+    match background::ensure_running() {
+        Ok(_) => println!("OK"),
+        Err(e) => {
+            println!("\x1b[33mне удалось: {}\x1b[0m\x1b[92m", e);
+            println!("  Прокси-сервис не запустился — обход 400 не включён.");
+            println!("  Проверьте, что есть пользовательский systemd (systemctl --user).");
+            return;
+        }
+    }
+    print!("Прописываем HTTPS_PROXY для Antigravity... ");
+    io::stdout().flush().ok();
+    match endpoint::apply_proxy(&proxy::proxy_url(), "") {
+        Ok(_) => println!("OK"),
+        Err(e) => {
+            println!("\x1b[33m{}\x1b[0m\x1b[92m", e);
+            return;
+        }
+    }
+    println!(
+        "  \x1b[38;5;154mПервый раз: выйдите из сессии и войдите снова (или\n  \
+         перезагрузитесь) — так HTTPS_PROXY применится ко всей сессии. Затем\n  \
+         откройте Antigravity обычным способом из меню, и ошибка 400 уйдёт.\x1b[0m\x1b[92m"
+    );
+}
+
+#[cfg(target_os = "windows")]
 fn apply_dns_patch(include_gemini: bool) {
     print!("\nФоновый DNS-резолвер... ");
     io::stdout().flush().ok();
@@ -385,6 +572,7 @@ fn handle_restore_dns() {
         Ok(_) => println!("готово."),
         Err(e) => println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e),
     }
+    background::disable_watchdog();
 
     print!("Удаление NRPT-правил DNS... ");
     io::stdout().flush().ok();
@@ -571,8 +759,8 @@ fn handle_revert_all() {
 
     kill_affected_processes();
 
-    // Stop the background relay first, and with it the watchdog: if it were
-    // still running it would see each binary revert as an "update" and
+    // Stop the background relay AND the standalone watchdog first: if either
+    // were still running it would see each binary revert as an "update" and
     // immediately re-patch, fighting the very revert in progress.
     print!("Остановка фоновой DNS-службы... ");
     io::stdout().flush().ok();
@@ -580,6 +768,7 @@ fn handle_revert_all() {
         Ok(_) => println!("готово."),
         Err(e) => println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e),
     }
+    background::disable_watchdog();
 
     let installs = find_all_installs();
     if installs.is_empty() {
@@ -594,7 +783,11 @@ fn handle_revert_all() {
             "Обработка:",
             mask_path(&inst.display().to_string())
         );
-        let n = unpatch_all_binaries(inst);
+        let mut n = unpatch_all_binaries(inst);
+        // The IDE's main.js / extension.js are REWRITTEN, not marked, so the
+        // binary revert above cannot undo them; without this the full revert left
+        // main.js patched (G25). Restores from the pristine backup patch_ide kept.
+        n += patch_ide::unpatch_ide_js(inst);
         if let Err(e) = restore_pristine_asar(&inst.join("resources")) {
             println!("  \x1b[33m[ERR] {}\x1b[0m\x1b[92m", e);
         }
@@ -804,39 +997,113 @@ fn handle_patch_antigravity() {
         }
     }
 
-    if (!successes.is_empty() || !failures.is_empty()) && is_admin() {
+    let did_something = !successes.is_empty() || !failures.is_empty();
+
+    // Windows: the DNS layer needs admin; bring the relay up and register the
+    // watchdog. The user-wide carrier stays off by default (kb/rivals.md).
+    #[cfg(target_os = "windows")]
+    if did_something && is_admin() {
         // Unconditionally, not only on a fresh machine: this run has to bring the
         // relay up and re-point the rules at it even when the rules already exist.
         apply_dns_patch(false);
-        // Turn the fast relay route on automatically. It needs no certificate
-        // (S19), so there is nothing for the user to weigh - press 1 and use
-        // Antigravity. And it is never a single point of failure: if the relay
-        // fails, the proxy falls straight through to the geohide DNS answer for
-        // `daily-` (the route that was primary before). A keyless clone has no
-        // relay baked in and simply stays on the DNS route.
-        if proxy::relay_available() {
-            let url = proxy::proxy_url();
-            print!("Быстрый маршрут (релей)... ");
-            io::stdout().flush().ok();
-            match endpoint::apply_proxy(&url, "") {
-                Ok(_) => println!("OK"),
-                Err(e) => println!("\x1b[33m{}\x1b[0m\x1b[92m", e),
-            }
-        }
+        // Register the standalone watchdog task too, so re-patch-on-update
+        // survives the relay being stopped or dying (G9). Best-effort.
+        let _ = background::enable_watchdog();
+    }
+
+    // Linux: phase-2 proxy route. No admin needed - the local CONNECT proxy is a
+    // systemd user unit and HTTPS_PROXY is a user drop-in - so it runs on every
+    // patch, not behind an is_admin gate.
+    #[cfg(not(target_os = "windows"))]
+    if did_something {
+        apply_dns_patch(false);
     }
 
     // Last, and never earlier: the CA may only go once the relay that signs with
-    // it has actually been replaced. See `remove_legacy_ca`.
+    // it has actually been replaced. See `remove_legacy_ca`. (No-op on Linux.)
     remove_legacy_ca();
 
     // Asked after the routes are in place, so the answer is "do you have
-    // something better" rather than "how should this work" - and so that Enter
-    // leaves a machine that already works.
-    if !successes.is_empty() || !failures.is_empty() {
+    // something better" rather than "how should this work".
+    if did_something {
         ask_for_own_proxy();
+        // Windows only: on Linux HTTPS_PROXY must STAY set (the proxy is the only
+        // route), and the running proxy already tries a saved own-proxy first, so
+        // there is nothing to reconcile and the exit advisory would mislead (the
+        // machine's own exit is not what the gate traffic uses any more).
+        #[cfg(target_os = "windows")]
+        {
+            reconcile_gate_proxy();
+            advise_on_exit();
+        }
     }
 
     print_results(&successes, &failures);
+}
+
+/// Tells the user where their traffic comes out and what that means for them.
+/// Advisory only (P16): it never changes what is installed, because a permitted
+/// exit is inferred from geolocation, not proven - the region 400 is invisible
+/// out of band. It exists so a user on a permitted VPN understands the DNS layer
+/// is now redundant insurance (G26), and a user in a blocked region understands
+/// the substitution is what is doing the work.
+fn advise_on_exit() {
+    print!("Проверка точки выхода... ");
+    io::stdout().flush().ok();
+    match upstream::machine_exit() {
+        Some((ip, loc)) if upstream::region_is_blocked(&loc) => {
+            println!("выход в «{}» ({}).", loc, ip);
+            println!(
+                "  Регион заблокирован — обход держится на подмене DNS. Всё настроено,\n  \
+                 модели должны отвечать. Свой прокси за рубежом (спросили выше) —\n  \
+                 самый быстрый путь, если он есть."
+            );
+        }
+        Some((ip, loc)) => {
+            println!("выход в «{}» ({}).", loc, ip);
+            println!(
+                "  Регион не заблокирован: гейт снимается самим выходом, а подмена DNS —\n  \
+                 подстраховка. Запросы идут напрямую к серверам Google, это быстрее всего."
+            );
+        }
+        None => {
+            // A dead trace is not worth a scary line: everything is already set up.
+            println!("не удалось определить (не важно, всё настроено).");
+        }
+    }
+}
+
+/// Points `HTTPS_PROXY` at our local gate proxy only when the user has their own
+/// exit configured; otherwise takes it back off so gate hosts resolve straight to
+/// their substituted address and connect DIRECT.
+///
+/// This is the demotion of the always-on relay carrier (see the note in
+/// `handle_patch_antigravity`). Two jobs:
+/// - **Own exit present** -> set the variable, so our local proxy carries the
+///   gate hosts through the user's proxy (its ladder: own -> built-in exit ->
+///   relay -> direct tunnel). Routing through their proxy is what they asked for,
+///   so the user-wide reach is acceptable here - and our local proxy still
+///   tunnels every non-gate host directly, so only gated calls pay the hop.
+/// - **No own exit** (the default, and every upgrade from <= 2.11.0_1) -> remove
+///   the variable. A machine patched by an older build still carries
+///   `HTTPS_PROXY=127.0.0.1:53129` from the old always-on route; leaving it would
+///   keep that machine on the slow carrier. Taking it off restores the fast
+///   direct path. Trigger is `configured()`, not `available()`: `available()`
+///   also asks `OWN.usable()`, which only the relay's warm loop sets, and it is
+///   not running at menu time.
+fn reconcile_gate_proxy() {
+    let url = proxy::proxy_url();
+    if upstream::configured().is_some() {
+        match endpoint::apply_proxy(&url, "") {
+            Ok(endpoint::Outcome::AlreadySet) => {}
+            Ok(_) => println!("Свой прокси включён для трафика Antigravity."),
+            Err(e) => println!("\x1b[33m{}\x1b[0m\x1b[92m", e),
+        }
+    } else {
+        // Same removal the undo paths use, scoped to our own value (G20/I45).
+        let ca = proxy::ca_cert_path().to_string_lossy().to_string();
+        endpoint::remove_proxy(&url, &ca).ok();
+    }
 }
 
 /// Which product an install directory is, for the progress line.
@@ -845,7 +1112,7 @@ fn handle_patch_antigravity() {
 /// because the line is printed before the work starts - that is the whole point
 /// of it.
 fn install_label(install: &Path) -> &'static str {
-    if install.join("agy.exe").exists() {
+    if install.join("agy.exe").is_file() || install.join("agy").is_file() {
         "Antigravity CLI"
     } else if install.join("Antigravity IDE.exe").exists()
         || install.join("resources").join("app").join("out").exists()
@@ -1139,9 +1406,16 @@ fn handle_manual_path() {
         }
     }
 
-    if (!successes.is_empty() || !failures.is_empty()) && is_admin() {
+    let did_something = !successes.is_empty() || !failures.is_empty();
+    #[cfg(target_os = "windows")]
+    if did_something && is_admin() {
         // Unconditionally, not only on a fresh machine: this run has to bring the
         // relay up and re-point the rules at it even when the rules already exist.
+        apply_dns_patch(false);
+    }
+    // Linux: the proxy route needs no admin (systemd user unit + user drop-in).
+    #[cfg(not(target_os = "windows"))]
+    if did_something {
         apply_dns_patch(false);
     }
 
@@ -1187,15 +1461,41 @@ fn main() {
         return;
     }
 
+    // Standalone watchdog: the same re-patch survival, decoupled from the relay
+    // so it keeps working when the relay is stopped or absent (G9). No network,
+    // no console. Its own logon task launches this; the loop keeps it alive.
+    if env::args().any(|a| a == background::WATCHDOG_FLAG) {
+        dns_forwarder::detach_console();
+        watchdog::run_forever();
+        return;
+    }
+
+    // Linux phase-2 proxy mode: run ONLY the local CONNECT proxy (no DNS, no :53).
+    // A systemd user unit launches this; `proxy::run` blocks until the process is
+    // stopped. `if_index` 0 = let the routing table pick (no VPN-bypass on Linux).
+    if env::args().any(|a| a == background::PROXY_FLAG) {
+        dns_forwarder::detach_console();
+        if let Err(e) = proxy::run(0) {
+            eprintln!("proxy: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // `--about` / `--license` / `--version`: prints the copyright notice and the
     // build canaries, then exits. Deliberately before the key prompt so any
     // binary can be fingerprinted without a licence key.
     canary::handle_cli_flags();
 
-    let window_title = format!("Antigravity анлокер v{}", APP_VERSION);
     #[cfg(target_os = "windows")]
-    console_style::set(&window_title);
+    {
+        let window_title = format!("Antigravity анлокер v{}", APP_VERSION);
+        console_style::set(&window_title);
+    }
 
+    // The admin pre-warning is about Windows UAC and the DNS layer that needs it.
+    // The Linux proxy route needs no root, so there is nothing to warn about.
+    #[cfg(target_os = "windows")]
     if !is_admin() && !is_nrpt_applied() {
         show_admin_prewarning();
     }
@@ -1203,7 +1503,9 @@ fn main() {
     login_screen();
 
     // The NRPT rules survive a reboot; the host routes that keep their queries
-    // off the VPN only survive it while the network stays the same.
+    // off the VPN only survive it while the network stays the same. Windows-only:
+    // Linux has no pinned-hosts fallback.
+    #[cfg(target_os = "windows")]
     if is_admin() {
         refresh_pinned_hosts();
     }
@@ -1249,6 +1551,9 @@ fn main() {
                 }
             );
         }
+        // Windows-only: the admin note is about the DNS layer's UAC requirement.
+        // The Linux proxy route needs no root.
+        #[cfg(target_os = "windows")]
         if !is_admin() && !is_nrpt_applied() {
             println!("Запущено без админ-прав: серверный патч будет пропущен.");
         }
@@ -1268,5 +1573,42 @@ fn main() {
                 thread::sleep(Duration::from_secs(1));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `%LOCALAPPDATA%` holds an `agy` *directory* (the CLI's folder).
+    /// An `exists()` check matched that directory, so the parent-walk in
+    /// `resolve_install_root` treated `%LOCALAPPDATA%` itself as an install root and
+    /// menu 1 reported `%LOCALAPPDATA% - Компоненты приложения не найдены`. A
+    /// launcher/CLI is a *file*, so a directory named `agy` must not qualify.
+    #[test]
+    fn a_directory_named_agy_does_not_make_its_parent_an_install() {
+        let base = env::temp_dir().join("ag_isroot_dir_test");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("agy").join("bin")).unwrap();
+        assert!(
+            !is_install_root(&base),
+            "a subdirectory named agy must not make its parent an install root"
+        );
+        // The empty agy dir is not a root either, so resolving a path under it must
+        // not walk up to `base`.
+        assert_ne!(resolve_install_root(&base.join("agy")), Some(base.clone()));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// The real CLI directory - one that actually holds the `agy` binary as a
+    /// file - still resolves as an install root.
+    #[test]
+    fn a_directory_holding_the_agy_binary_is_an_install() {
+        let base = env::temp_dir().join("ag_isroot_file_test");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("agy"), b"binary").unwrap();
+        assert!(is_install_root(&base));
+        fs::remove_dir_all(&base).ok();
     }
 }

@@ -165,6 +165,7 @@ pub fn open_hint(keyword: &str) -> String {
     }
 }
 
+#[cfg(target_os = "windows")]
 pub fn mask_path(path: &str) -> String {
     let mut result = path.to_string();
     if let Ok(local) = env::var("LOCALAPPDATA") {
@@ -179,6 +180,15 @@ pub fn mask_path(path: &str) -> String {
     result
 }
 
+/// Same idea on Linux, where the one directory worth eliding is the home dir.
+#[cfg(not(target_os = "windows"))]
+pub fn mask_path(path: &str) -> String {
+    match env::var("HOME") {
+        Ok(home) if !home.is_empty() => path.replace(&home, "~"),
+        _ => path.to_string(),
+    }
+}
+
 /// A path short enough to sit in a progress line: the last few components,
 /// with anything above them elided.
 ///
@@ -187,8 +197,11 @@ pub fn mask_path(path: &str) -> String {
 /// only question is "which of my installs is this".
 pub fn short_path(path: &str) -> String {
     // Written as a code point so no tool that rewrites escapes can turn one
-    // separator into two, or none.
+    // separator into two, or none. Backslash on Windows, forward slash elsewhere.
+    #[cfg(target_os = "windows")]
     const SEP: char = '\u{5C}';
+    #[cfg(not(target_os = "windows"))]
+    const SEP: char = '/';
     let parts: Vec<&str> = path.split(SEP).filter(|p| !p.is_empty()).collect();
     if parts.len() <= 3 {
         return path.to_string();
@@ -206,9 +219,16 @@ pub fn is_admin() -> bool {
     unsafe { IsUserAnAdmin() != 0 }
 }
 
+/// On Linux "admin" means the effective user is root: the DNS/relay layer edits
+/// resolver policy and binds a privileged port, both of which need it, while the
+/// binary/JS patch only needs write access to the install (checked where it is
+/// applied). `geteuid` is the direct question, with no libc dependency.
 #[cfg(not(target_os = "windows"))]
 pub fn is_admin() -> bool {
-    false
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() == 0 }
 }
 
 #[cfg(test)]

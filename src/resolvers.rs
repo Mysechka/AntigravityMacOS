@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread;
@@ -27,12 +27,30 @@ use rustls::ClientConnection;
 // When a provider re-adds a name, or a new provider is added below, it starts
 // being used with no code change and no release.
 
+/// How a provider is reached.
+///
+/// The distinction is not cosmetic: `v4`/`v6` are also what an NRPT rule lists
+/// as fallback nameservers (I5, I22), and Windows can only be pointed at a
+/// plain resolver. A DoH endpoint answers no UDP query at all, so putting one
+/// in a rule would hand a name a nameserver that never replies. That is
+/// enforced structurally - a `Doh` provider carries **empty** `v4`/`v6`, so
+/// `fallback_v4`, `all_v6` and `substituting_addrs` all skip it without needing
+/// to know about transports - and asserted by `a_doh_provider_is_never_offered_
+/// as_a_nameserver`.
+pub enum Transport {
+    /// Plain DNS on UDP:53, queried over a socket pinned to the ISP interface.
+    Udp,
+    /// DNS-over-HTTPS. Reachable only through the relay, never by Windows.
+    Doh(&'static crate::doh::Endpoint),
+}
+
 /// One unblock service. Addresses are tried in order; the first that answers
 /// speaks for the provider, so a dead front-end does not cost it the race.
 pub struct Provider {
     pub name: &'static str,
     pub v4: &'static [&'static str],
     pub v6: &'static [&'static str],
+    pub transport: Transport,
 }
 
 /// Services that substitute Google/AI endpoints for clients they geolocate to a
@@ -40,22 +58,53 @@ pub struct Provider {
 /// front a real SNI proxy (see kb/dns.md); their lists differ and change
 /// without notice, which is exactly why the choice is made per query.
 pub const PROVIDERS: &[Provider] = &[
+    // First on purpose. Measured 2026-08-30 against 8.8.8.8: it substitutes
+    // `cloudcode-pa.googleapis.com` -> 186.246.45.126 (TTL 60), and that address
+    // accepts the SNI and answers as Google's own frontend (`Server: ESF`, valid
+    // certificate, TLS handshake 0.30 s). `cloudcode-pa` is the name a 22-resolver
+    // sweep found **nobody** substituting (S9) - the whole reason the client used
+    // to be pushed onto `daily-` instead (N15). It substitutes `daily-` and
+    // `generativelanguage` from the same address, and correctly passes
+    // `jetski-webchannel` through, so it is not a blanket rewriter.
+    //
+    // `v4`/`v6` are empty because it speaks **only** DoH over HTTP/2 - HTTP/1.1
+    // gets a 505 and its two addresses answer nothing on UDP:53. See `Transport`
+    // for why that emptiness is load-bearing rather than an omission.
+    Provider {
+        name: "dns-ai.ru",
+        v4: &[],
+        v6: &[],
+        transport: Transport::Doh(&DNS_AI),
+    },
     Provider {
         name: "xbox-dns.ru",
         v4: &["111.88.96.50", "111.88.96.51"],
         v6: &["2a00:ab00:1233:26::50", "2a00:ab00:1233:26::51"],
+        transport: Transport::Udp,
     },
     Provider {
         name: "comss.one",
         v4: &["83.220.169.155", "212.109.195.93", "195.133.25.16"],
         v6: &[],
+        transport: Transport::Udp,
     },
     Provider {
         name: "geohide.ru",
         v4: &["45.155.204.190", "37.230.192.51"],
         v6: &["2a0c:9300:0:54::1"],
+        transport: Transport::Udp,
     },
 ];
+
+/// Addresses are the two `dns.dns-ai.ru` resolves to, hardcoded so the relay can
+/// reach it before anything else resolves. Safe because the certificate still has
+/// to prove the name (`*.dns-ai.ru`, verified live), so a stale or poisoned
+/// address fails the handshake instead of becoming a silent man-in-the-middle.
+pub static DNS_AI: crate::doh::Endpoint = crate::doh::Endpoint {
+    host: "dns.dns-ai.ru",
+    path: "/dns-query",
+    addrs: &["217.60.10.20", "186.246.49.127"],
+};
 
 /// Resolvers used only to recognise an unsubstituted answer. They must be
 /// services with no geo-unblocking of their own - that is the whole point of
@@ -98,6 +147,27 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 /// the race that follows is budgeted, so the two together stay inside the
 /// second.
 const FAST_PATH_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// The floor a DoH provider gets on the fast path, in place of
+/// `FAST_PATH_TIMEOUT`.
+///
+/// 250 ms is right for a UDP one-shot and impossible for DoH: the TLS handshake
+/// alone measured 0.29 s, so the chosen provider would fail every time, be
+/// forgotten, and re-race - the fast path turned into its own slow path. A full
+/// DoH exchange measured ~0.35 s, and this still leaves most of the second
+/// Windows waits before it asks the fallback nameserver (I23).
+const DOH_FAST_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// How long a race will hold a decided answer waiting for the preferred
+/// provider. Inside `RACE_BUDGET`, and sized by the same ~0.35 s measurement.
+const PREFERRED_GRACE: Duration = Duration::from_millis(500);
+
+/// Names worth waiting a moment longer for the preferred provider on: the two
+/// hosts the gate actually lives on.
+const PREFERRED_NAMES: &[&str] = &[
+    "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
+];
 
 /// How long a vetted answer is handed straight back out of memory.
 ///
@@ -738,15 +808,34 @@ fn ask_provider(
     if_index: u32,
     timeout: Duration,
 ) -> Option<Vec<u8>> {
-    for server in provider.v4 {
-        let Ok(ip) = server.parse::<Ipv4Addr>() else {
-            continue;
-        };
-        if let Ok(reply) = dns_client::query_raw_via(query, ip, if_index, timeout) {
-            return Some(reply);
+    match provider.transport {
+        Transport::Udp => {
+            for server in provider.v4 {
+                let Ok(ip) = server.parse::<Ipv4Addr>() else {
+                    continue;
+                };
+                if let Ok(reply) = dns_client::query_raw_via(query, ip, if_index, timeout) {
+                    return Some(reply);
+                }
+            }
+            None
+        }
+        Transport::Doh(endpoint) => {
+            let mut reply = crate::doh::query(endpoint, query, timeout).ok()?;
+            // Re-stamp the transaction id. RFC 8484 tells a DoH client to send 0
+            // and a server is free to answer with 0 whatever we asked with, but
+            // the reply is handed to Windows over UDP:53, where an id that does
+            // not match the question is simply dropped - a failure that would
+            // look exactly like the resolver being slow. Nothing else in the
+            // message is touched: the relay's contract is that it forwards the
+            // provider's own bytes (I23).
+            if reply.len() >= 2 && query.len() >= 2 {
+                reply[0] = query[0];
+                reply[1] = query[1];
+            }
+            Some(reply)
         }
     }
-    None
 }
 
 /// What one racer produced.
@@ -760,6 +849,95 @@ enum Heat {
     /// An honest resolver's answer for `CONTROL_NAME`, without which the line
     /// above cannot be believed.
     ControlReference(Vec<IpAddr>),
+}
+
+/// Whether a tunnel is carrying this machine's traffic, as last seen by the
+/// relay's warm loop (`VPN_CHECK_EVERY`).
+///
+/// A plain flag rather than a parameter threaded through six call sites, and a
+/// flag the *relay* sets rather than something this module probes: detection
+/// shells out to PowerShell, and nothing that a client query waits on may do
+/// that. Defaults to `false`, which is the pre-existing behaviour - a machine
+/// that never learns the answer keeps substituting exactly as before.
+static VPN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_vpn_active(active: bool) {
+    VPN_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+pub fn vpn_is_active() -> bool {
+    VPN_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Answers a routed name the way the tunnel's own resolver would, and says so.
+///
+/// Used while a VPN is up. Substituting there is worse than useless: an NRPT
+/// rule overrides the resolver the user deliberately turned on, and the address
+/// it hands back points at a provider's proxy that the traffic then reaches
+/// *through* the tunnel - a detour to reach what the tunnel already reaches
+/// directly, and pure loss when the exit is somewhere the gate does not apply
+/// (S25, G26).
+///
+/// It asks the reference resolvers over the **default route** - `if_index` 0, so
+/// the query leaves through the tunnel like everything else - rather than
+/// reading the VPN's own configured servers. Same result for these names, and it
+/// avoids depending on that configuration being usable: this was written on a
+/// machine whose VPN set DNS to two addresses that answer nothing at all on
+/// UDP:53, being DoH-only.
+///
+/// The verdict is honestly `Passthrough`, so the answer is capped at
+/// `PASSTHROUGH_TTL` and never outranks a real substitution left in the cache
+/// from before the tunnel came up (I26).
+fn resolve_through_tunnel(
+    query: &[u8],
+    from_client: bool,
+) -> Option<(Vec<u8>, &'static str, Verdict)> {
+    for server in REFERENCE_V4 {
+        let Ok(ip) = server.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        let budget = if from_client {
+            FAST_PATH_TIMEOUT
+        } else {
+            QUERY_TIMEOUT
+        };
+        if let Ok(reply) = dns_client::query_raw_via(query, ip, 0, budget) {
+            let reply = dns_client::cap_ttl(&reply, PASSTHROUGH_TTL).unwrap_or(reply);
+            remember_answer(query, &reply, "VPN", Verdict::Passthrough, from_client);
+            return Some((reply, "VPN", Verdict::Passthrough));
+        }
+    }
+    None
+}
+
+/// The provider to prefer for `name`, and how long a racer may be held for it.
+///
+/// A DoH provider loses a fair race by construction: it pays a TLS handshake
+/// where a UDP provider answers in one round trip, so listing it first in
+/// `PROVIDERS` buys nothing on its own. What is worth preferring is not the DNS
+/// latency but **the proxy the answer points at**, which is the number the IDE
+/// actually feels - measured, dns-ai.ru's proxy completes TLS in 0.29 s against
+/// comss's 0.37-0.99 s and geohide's 1.3-7.8 s. It is also the owner's own
+/// service, so an outage is his to fix rather than a third party's to notice.
+///
+/// Deliberately narrow: two names, one bounded wait, and no effect at all once
+/// the answer cache is warm - which is the state a client query is normally in.
+fn preferred_provider(name: &str) -> Option<usize> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if !PREFERRED_NAMES.contains(&name.as_str()) {
+        return None;
+    }
+    PROVIDERS
+        .iter()
+        .position(|p| matches!(p.transport, Transport::Doh(_)))
+}
+
+/// What a one-shot to `provider` needs at minimum, whatever the caller budgeted.
+fn one_shot_floor(provider: &Provider, budget: Duration) -> Duration {
+    match provider.transport {
+        Transport::Doh(_) => budget.max(DOH_FAST_TIMEOUT),
+        Transport::Udp => budget,
+    }
 }
 
 /// Answers `query`, from memory when a recent vetted answer is there and from
@@ -795,6 +973,17 @@ fn resolve_upstream(
     let name = dns_client::question_name(query).unwrap_or_default();
     let key = (name, qtype);
 
+    // With a tunnel up the VPN decides, not us. Checked before the choice cache
+    // as well as before the race, or a provider chosen minutes earlier would go
+    // on answering for the whole `CHOICE_TTL` after the user connected.
+    if vpn_is_active() {
+        if let Some(hit) = resolve_through_tunnel(query, from_client) {
+            return Some(hit);
+        }
+        // The tunnel's resolver is not answering either; fall through rather
+        // than hand the client nothing.
+    }
+
     // Anything that is not an address lookup cannot be classified, so it goes
     // to whichever provider is already known good for this name - or the first
     // one that answers.
@@ -810,7 +999,8 @@ fn resolve_upstream(
     };
 
     if let Some((idx, verdict)) = cached_choice(&key) {
-        if let Some(reply) = ask_provider(&PROVIDERS[idx], query, if_index, one_shot) {
+        let budget = one_shot_floor(&PROVIDERS[idx], one_shot);
+        if let Some(reply) = ask_provider(&PROVIDERS[idx], query, if_index, budget) {
             let reply = vet(reply, verdict, !from_client, Some(key.0.as_str()));
             remember_answer(query, &reply, PROVIDERS[idx].name, verdict, from_client);
             return prefer_substituted(query, from_client, (reply, PROVIDERS[idx].name, verdict));
@@ -893,6 +1083,8 @@ fn resolve_upstream(
     drop(tx);
 
     let deadline = Instant::now() + RACE_BUDGET;
+    let preferred = preferred_provider(&key.0);
+    let grace_until = Instant::now() + PREFERRED_GRACE;
     let mut reference: Vec<IpAddr> = Vec::new();
     let mut replies: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut control: Vec<(usize, Vec<IpAddr>)> = Vec::new();
@@ -936,8 +1128,25 @@ fn resolve_upstream(
         // change a verdict. Once they are in - or were never started - the
         // first clear winner ends the race.
         let still_learning = learning && !got_control_reference;
-        if got_reference && !replies.is_empty() && !still_learning {
-            if let Some(hit) = pick(&replies, &reference, Verdict::Substituted) {
+        // Hold a decided race briefly for the preferred provider, but only while
+        // it could still turn up and only for the names it is preferred on. Past
+        // the grace the pool answers as it always did - preference must never
+        // become a way to answer slower than the tool used to.
+        let holding_for_preferred = preferred
+            .is_some_and(|p| !replies.iter().any(|(i, _)| *i == p) && Instant::now() < grace_until);
+        if got_reference && !replies.is_empty() && !still_learning && !holding_for_preferred {
+            // The preferred provider wins among equals; `pick` decides otherwise.
+            let hit = preferred
+                .and_then(|p| replies.iter().position(|(i, _)| *i == p))
+                .filter(|&h| {
+                    classify(
+                        &dns_client::answer_addrs(&replies[h].1),
+                        &reference,
+                        &known_proxy_addrs(replies[h].0),
+                    ) == Verdict::Substituted
+                })
+                .or_else(|| pick(&replies, &reference, Verdict::Substituted));
+            if let Some(hit) = hit {
                 let name = key.0.clone();
                 remember_choice(key, replies[hit].0, Verdict::Substituted);
                 let (idx, reply) = replies.swap_remove(hit);
@@ -1199,10 +1408,17 @@ mod tests {
         IpAddr::V4(s.parse().unwrap())
     }
 
+    fn udp_providers() -> Vec<&'static Provider> {
+        PROVIDERS
+            .iter()
+            .filter(|p| matches!(p.transport, Transport::Udp))
+            .collect()
+    }
+
     #[test]
-    fn every_provider_has_at_least_one_address() {
+    fn every_udp_provider_has_at_least_one_address() {
         assert!(!PROVIDERS.is_empty());
-        for p in PROVIDERS {
+        for p in udp_providers() {
             assert!(!p.v4.is_empty(), "{} has no IPv4 address", p.name);
             for a in p.v4 {
                 assert!(a.parse::<Ipv4Addr>().is_ok(), "{} is not an address", a);
@@ -1213,11 +1429,120 @@ mod tests {
     /// The NRPT rule takes one address per provider, so a provider outage falls
     /// through to a different service rather than to its own dead sibling.
     #[test]
-    fn the_fallback_list_is_one_address_per_provider() {
+    fn the_fallback_list_is_one_address_per_udp_provider() {
         let fallback = fallback_v4();
-        assert_eq!(fallback.len(), PROVIDERS.len());
-        for (i, p) in PROVIDERS.iter().enumerate() {
+        let udp = udp_providers();
+        assert_eq!(fallback.len(), udp.len());
+        for (i, p) in udp.iter().enumerate() {
             assert_eq!(fallback[i], p.v4[0]);
+        }
+    }
+
+    /// The invariant a DoH provider lives or dies by.
+    ///
+    /// `fallback_v4`/`all_v6` feed NRPT nameserver lists, and Windows can only be
+    /// pointed at something that answers UDP:53. A DoH endpoint answers nothing
+    /// there - measured: both of dns-ai.ru's addresses time out on 53 - so if one
+    /// ever reached a rule, that name would get a nameserver that never replies
+    /// and the whole rule would hang on it. Enforced structurally by empty
+    /// `v4`/`v6`, which is easy to undo by accident while "filling in" a provider
+    /// entry, so it is asserted rather than commented.
+    #[test]
+    fn a_doh_provider_is_never_offered_as_a_nameserver() {
+        let listed: Vec<&str> = fallback_v4().into_iter().chain(all_v6()).collect();
+        for p in PROVIDERS {
+            let Transport::Doh(endpoint) = p.transport else {
+                continue;
+            };
+            assert!(
+                p.v4.is_empty() && p.v6.is_empty(),
+                "{} speaks DoH, so its address list must stay empty",
+                p.name
+            );
+            for a in endpoint.addrs {
+                assert!(
+                    !listed.contains(a),
+                    "{} would be handed to Windows as a nameserver",
+                    a
+                );
+            }
+        }
+    }
+
+    /// The flag defaults to "no tunnel", which is the behaviour every existing
+    /// machine already has: a relay that never learns the answer keeps
+    /// substituting exactly as before rather than quietly standing down.
+    #[test]
+    fn the_vpn_flag_defaults_to_off_and_round_trips() {
+        assert!(!vpn_is_active(), "должно быть выключено по умолчанию");
+        set_vpn_active(true);
+        assert!(vpn_is_active());
+        set_vpn_active(false);
+        assert!(!vpn_is_active());
+    }
+
+    /// Preference is for the two gate names and nothing else. Widening it would
+    /// put a bounded wait on names that never needed one.
+    #[test]
+    fn only_the_gate_names_have_a_preferred_provider() {
+        let doh = PROVIDERS
+            .iter()
+            .position(|p| matches!(p.transport, Transport::Doh(_)))
+            .expect("a DoH provider");
+        assert_eq!(preferred_provider("cloudcode-pa.googleapis.com"), Some(doh));
+        assert_eq!(
+            preferred_provider("daily-cloudcode-pa.googleapis.com"),
+            Some(doh)
+        );
+        // A question name may arrive rooted or in any case; neither changes it.
+        assert_eq!(
+            preferred_provider("CloudCode-PA.GoogleAPIs.com."),
+            Some(doh)
+        );
+        for other in [
+            "generativelanguage.googleapis.com",
+            "jetski-webchannel.googleapis.com",
+            "accounts.google.com",
+            "",
+        ] {
+            assert_eq!(preferred_provider(other), None, "{}", other);
+        }
+    }
+
+    /// 250 ms cannot cover a TLS handshake, so a cached choice pointing at the
+    /// DoH provider would fail on the fast path every time, be forgotten, and
+    /// re-race - the fast path becoming the slow one.
+    #[test]
+    fn the_fast_path_gives_a_doh_provider_room_to_answer() {
+        let doh = PROVIDERS
+            .iter()
+            .find(|p| matches!(p.transport, Transport::Doh(_)))
+            .expect("a DoH provider");
+        let udp = PROVIDERS
+            .iter()
+            .find(|p| matches!(p.transport, Transport::Udp))
+            .expect("a UDP provider");
+        assert_eq!(one_shot_floor(doh, FAST_PATH_TIMEOUT), DOH_FAST_TIMEOUT);
+        assert_eq!(one_shot_floor(udp, FAST_PATH_TIMEOUT), FAST_PATH_TIMEOUT);
+        // A caller that already budgeted more keeps it.
+        assert_eq!(one_shot_floor(doh, QUERY_TIMEOUT), QUERY_TIMEOUT);
+        // And the whole thing still fits inside the second Windows waits (I23).
+        assert!(DOH_FAST_TIMEOUT < Duration::from_secs(1));
+        assert!(PREFERRED_GRACE <= RACE_BUDGET);
+    }
+
+    /// A DoH endpoint's addresses still have to be addresses: they are dialled
+    /// directly, precisely so the resolver is reachable before DNS works.
+    #[test]
+    fn doh_endpoints_carry_parsable_addresses() {
+        for p in PROVIDERS {
+            if let Transport::Doh(endpoint) = p.transport {
+                assert!(!endpoint.addrs.is_empty(), "{} has no address", p.name);
+                for a in endpoint.addrs {
+                    assert!(a.parse::<IpAddr>().is_ok(), "{} is not an address", a);
+                }
+                assert!(endpoint.path.starts_with('/'), "path must be absolute");
+            }
         }
     }
 

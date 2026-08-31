@@ -56,8 +56,12 @@ const CA_NAME: &str = "AG Unlocker local CA";
 #[cfg(relay)]
 #[path = "relay.rs"]
 mod relay;
+// `relay_available` is used inside this module (`relay::relay_available()`); it is
+// no longer re-exported because 2.11.0_1 stopped turning the carrier on from
+// `main` by default (kb/rivals.md). `#[allow(unused_imports)]` keeps the stub
+// build (cfg(not(relay))) honest without a second cfg arm.
 #[cfg(relay)]
-pub use relay::{probe_relay, relay_available, relay_is_benched};
+pub use relay::{probe_relay, relay_is_benched};
 
 #[cfg(not(relay))]
 pub fn relay_available() -> bool {

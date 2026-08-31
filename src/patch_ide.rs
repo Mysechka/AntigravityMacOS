@@ -1,8 +1,130 @@
 use regex::Regex;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::patch_binary::RepatchOutcome;
+
+/// Suffix of the pristine copy kept beside a JS file we rewrite. Same string the
+/// bootstrap tooling uses, so they interoperate.
+///
+/// Why a backup at all (2.11.0_1): `patch_ide` REWRITES the auth function body,
+/// which - unlike the same-length binary rename - cannot be reversed from the
+/// patched bytes alone. Without a pristine copy, "Полный откат" left the IDE's
+/// `main.js` patched forever (G25). The backup is written once, before the first
+/// edit, and the revert restores from it.
+const JS_BAK: &str = ".ag_backup";
+
+fn backup_path(target: &Path) -> PathBuf {
+    let mut s = target.as_os_str().to_os_string();
+    s.push(JS_BAK);
+    PathBuf::from(s)
+}
+
+/// Copies `target` to its `.ag_backup` once - never overwriting an existing one,
+/// which is by construction the pristine copy from before we ever touched it.
+/// Best-effort: a failed backup must not stop a patch (the same-marker check
+/// still prevents double-patching), but it is logged so a missing backup is not
+/// silent.
+fn backup_once(target: &Path) {
+    let bak = backup_path(target);
+    if bak.exists() {
+        return;
+    }
+    if let Err(e) = fs::copy(target, &bak) {
+        eprintln!("  [WARN] бэкап {} не создан: {}", target.display(), e);
+    }
+}
+
+/// Writes `content` to `path` without a torn intermediate state: a sibling temp
+/// on the same directory, then a rename over the target (atomic replace on
+/// Windows and POSIX). A crash or power loss leaves either the old file or the
+/// new one, never a half-written 15 MB `main.js`.
+fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".agtmp");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, content)?;
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Restores a JS file we rewrote from its pristine backup, and removes the
+/// backup. Returns `Ok(true)` when it restored something, `Ok(false)` when there
+/// was nothing of ours to undo.
+///
+/// A backup is the only faithful revert (the body was rewritten, not marked), so
+/// this prefers it. If the backup is gone but our marker is present, it strips
+/// the marker as a last resort and says so - the auth body then stays rewritten,
+/// which still lets Antigravity run; a clean restore needs a reinstall.
+fn restore_js(target: &Path) -> Result<bool, String> {
+    let bak = backup_path(target);
+    if bak.exists() {
+        let data = fs::read(&bak).map_err(|e| format!("не прочитать бэкап: {}", e))?;
+        let text = String::from_utf8_lossy(&data).into_owned();
+        write_atomic(target, &text)
+            .map_err(|e| format!("не записать {}: {}", target.display(), e))?;
+        fs::remove_file(&bak).ok();
+        return Ok(true);
+    }
+    let Ok(content) = fs::read_to_string(target) else {
+        return Ok(false);
+    };
+    if let Some(stripped) = strip_marker(&content) {
+        write_atomic(target, &stripped)
+            .map_err(|e| format!("не записать {}: {}", target.display(), e))?;
+        eprintln!(
+            "  [WARN] {}: бэкап отсутствует — снят только маркер, тело патча осталось \
+             (для чистого возврата переустановите Antigravity)",
+            target.display()
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Reverts our IDE JS edits (`main.js` and the extension) for one install.
+/// Returns how many files it restored.
+pub fn unpatch_ide_js(inst: &Path) -> usize {
+    let mut n = 0;
+    let main_js = inst
+        .join("resources")
+        .join("app")
+        .join("out")
+        .join("main.js");
+    if main_js.exists() {
+        match restore_js(&main_js) {
+            Ok(true) => {
+                println!("  [OK] main.js — возвращён из бэкапа");
+                n += 1;
+            }
+            Ok(false) => {}
+            Err(e) => println!("  \x1b[33m[ERR] main.js: {}\x1b[0m\x1b[92m", e),
+        }
+    }
+    let ext = inst
+        .join("resources")
+        .join("app")
+        .join("extensions")
+        .join("antigravity")
+        .join("dist")
+        .join("extension.js");
+    if ext.exists() {
+        match restore_js(&ext) {
+            Ok(true) => {
+                println!("  [OK] extension.js — возвращён из бэкапа");
+                n += 1;
+            }
+            Ok(false) => {}
+            Err(e) => println!("  \x1b[33m[ERR] extension.js: {}\x1b[0m\x1b[92m", e),
+        }
+    }
+    n
+}
 
 fn detect_stacked_ide(content: &str) -> bool {
     content.contains("/*[AG_PATCHED]*/") || content.contains("[AG_PROXY_HOOK]")
@@ -89,7 +211,10 @@ pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
                 + &content[caps.get(0).unwrap().end()..],
             crate::canary::file_marker()
         );
-        fs::write(main_js, new_content).map_err(|e| e.to_string())?;
+        // Pristine copy before the first edit, so the revert can restore it (G25),
+        // then an atomic write so a crash cannot leave a half-written main.js.
+        backup_once(main_js);
+        write_atomic(main_js, &new_content).map_err(|e| e.to_string())?;
         Ok(())
     } else {
         Err("Сигнатура не найдена (возможно, установлена другая версия)".to_string())
@@ -416,6 +541,66 @@ mod tests {
         assert!(!has_marker(""));
     }
 
+    /// The G25 fix, end to end on real files: a backup taken before a rewrite is
+    /// what `restore_js` uses to put the exact original bytes back, and the backup
+    /// is then removed. Without this the full revert left main.js patched.
+    #[test]
+    fn a_backup_restores_the_exact_original_and_is_removed() {
+        let dir = std::env::temp_dir().join("ag_js_restore_test");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js");
+        let original = "// pristine main.js\nconst x = 1;\n";
+        fs::write(&target, original).unwrap();
+
+        // First backup captures the pristine file.
+        backup_once(&target);
+        assert!(backup_path(&target).exists());
+        // A "patch": rewrite the body and append a marker.
+        write_atomic(&target, "REWRITTEN BODY\n// UNLOCKED").unwrap();
+        // A second backup must NOT overwrite the pristine one.
+        backup_once(&target);
+
+        assert_eq!(restore_js(&target).unwrap(), true);
+        assert_eq!(fs::read_to_string(&target).unwrap(), original, "byte-exact");
+        assert!(!backup_path(&target).exists(), "backup consumed");
+        // Nothing left to undo now.
+        assert_eq!(restore_js(&target).unwrap(), false);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no backup but our marker present, restore strips the marker as a last
+    /// resort (the body stays rewritten) rather than doing nothing.
+    #[test]
+    fn restore_without_a_backup_at_least_strips_the_marker() {
+        let dir = std::env::temp_dir().join("ag_js_restore_nombak");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js");
+        fs::write(&target, "body\n// UNLOCKED").unwrap();
+
+        assert_eq!(restore_js(&target).unwrap(), true);
+        assert!(!has_marker(&fs::read_to_string(&target).unwrap()));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A crash mid-write must never leave a torn target: `write_atomic` replaces
+    /// via a rename, so the target is only ever the old or the new content, and
+    /// the temp is cleaned up.
+    #[test]
+    fn atomic_write_replaces_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join("ag_js_atomic");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("f.js");
+        fs::write(&target, "old").unwrap();
+        write_atomic(&target, "new content").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new content");
+        let mut tmp = target.as_os_str().to_os_string();
+        tmp.push(".agtmp");
+        assert!(!std::path::Path::new(&tmp).exists(), "temp cleaned up");
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn strip_marker_removes_both_shapes_and_nothing_else() {
         let body = "line one\nline two";
@@ -504,6 +689,7 @@ pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
         new_content,
         crate::canary::file_marker()
     );
-    fs::write(&ext_path, marked).map_err(|e| e.to_string())?;
+    backup_once(&ext_path);
+    write_atomic(&ext_path, &marked).map_err(|e| e.to_string())?;
     Ok(true)
 }
