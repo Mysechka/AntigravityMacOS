@@ -277,9 +277,15 @@ fn ps_string_list_owned(items: &[String]) -> String {
 /// forced the fallback path.
 pub struct DnsOutcome {
     pub vpn_active: bool,
-    /// True when a tunnel was up and this run therefore installed **no** rules
-    /// and left the machine resolving exactly as the VPN configured it.
+    /// True when a tunnel was up **and the client was measured inside it**, so
+    /// this run installed no rules and left the machine resolving exactly as the
+    /// VPN configured it.
     pub stood_down_for_vpn: bool,
+    /// Which way the client's own traffic was going. Only measured when a tunnel
+    /// is up - with none there is nothing for it to decide - so `Unknown` here
+    /// means either "no tunnel" or "tunnel, client not running"; `vpn_active`
+    /// separates the two.
+    pub client: egress::ClientEgress,
     pub via_relay: bool,
     pub pinned: Vec<String>,
     pub pin_error: Option<String>,
@@ -459,10 +465,22 @@ pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
     // Russian one without asking, and the owner's instruction is unambiguous:
     // with a VPN up, the VPN decides. `remove_dns_nrpt()` above has already taken
     // ours off, which is the whole of the work.
-    if egress.as_ref().is_some_and(|e| e.vpn_active) {
+    //
+    // What that reasoning silently assumed is that a tunnel carrying a default
+    // route carries *the client*. Windows VPN clients route per application, so
+    // it need not: with `language_server.exe` on an exclusion list the machine
+    // shows a full tunnel while the client talks to Google straight off the ISP
+    // link. Standing down there leaves it in the blocked region with nothing at
+    // all - the one state that cannot work (G29). So the condition is now the
+    // measured one, and the absence of a measurement installs the rules rather
+    // than skipping them; `egress::stand_down_for_vpn` carries the whole rule and
+    // the reason for it.
+    let (stand_down, client) = egress::vpn_verdict(egress.as_ref());
+    if stand_down {
         return Ok(DnsOutcome {
             vpn_active: true,
             stood_down_for_vpn: true,
+            client,
             via_relay,
             pinned: Vec::new(),
             pin_error: None,
@@ -563,6 +581,7 @@ pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
     Ok(DnsOutcome {
         vpn_active: egress.as_ref().map_or(false, |e: &Egress| e.vpn_active),
         stood_down_for_vpn: false,
+        client,
         via_relay,
         pinned,
         pin_error,
@@ -582,11 +601,34 @@ pub fn outcome_note(o: &DnsOutcome) -> Option<String> {
     // assume the step silently failed.
     if o.stood_down_for_vpn {
         return Some(
-            "  Обнаружен активный VPN — правила DNS не создавались.\n  \
-             Запросы идут так, как их настраивает VPN. Если выход VPN\n  \
-             в разрешённом регионе, обход уже работает и без наших правил;\n  \
-             если нет — отключите VPN и запустите пункт 1 снова."
+            "  Обнаружен активный VPN, трафик Antigravity идёт через него —\n  \
+             правила DNS не создавались. Запросы идут так, как их настраивает\n  \
+             VPN. Если выход VPN в разрешённом регионе, обход уже работает и\n  \
+             без наших правил; если нет — отключите VPN и запустите пункт 1 снова."
                 .to_string(),
+        );
+    }
+
+    // The two cases a tunnel used to swallow. Said early and in full, because a
+    // user who sees "VPN обнаружен" and rules created at the same time will
+    // otherwise read it as the tool contradicting itself.
+    if o.vpn_active {
+        lines.push(
+            match o.client {
+                egress::ClientEgress::Physical => {
+                    "  VPN активен, но трафик Antigravity идёт мимо него\n  \
+                     (исключён из VPN) — правила DNS созданы: без них\n  \
+                     запросы уходят из заблокированного региона и возвращают\n  \
+                     ошибку 400."
+                }
+                _ => {
+                    "  VPN активен, Antigravity не запущен — проверить, идёт ли\n  \
+                     его трафик через VPN, не удалось. Правила DNS созданы:\n  \
+                     лишние они лишь замедляют на один переход, а недостающие\n  \
+                     дают ошибку 400."
+                }
+            }
+            .to_string(),
         );
     }
 
@@ -644,10 +686,13 @@ fn fallback_note(o: &DnsOutcome) -> Option<String> {
             o.pinned.len()
         ));
     }
+    // Says nothing about the VPN itself: `outcome_note` has already printed a
+    // line about it by the time this is reached, and saying "VPN активен" twice
+    // in one step reads as two different findings.
     if o.vpn_active {
         return Some(
-            "  \x1b[33mVPN активен, но резолвер не подменяет адреса даже с канала\n  \
-             провайдера — проверьте, что xbox-dns доступен.\x1b[0m\x1b[92m"
+            "  \x1b[33mРезолвер не подменяет адреса даже с канала провайдера —\n  \
+             проверьте, что DNS-провайдеры доступны.\x1b[0m\x1b[92m"
                 .to_string(),
         );
     }
@@ -677,7 +722,14 @@ pub fn refresh_pinned_hosts() {
     if !is_nrpt_applied() {
         return;
     }
-    if egress::detect().is_some_and(|e| e.vpn_active) {
+    // Same evidence rule as `setup_dns_nrpt_with`, and it matters more here: this
+    // runs unattended on every elevated start, so reading "a tunnel is up" as
+    // "the client is in it" would quietly strip a working configuration off a
+    // machine whose client is excluded from that tunnel (G29). Rules are removed
+    // only when the client is measured inside it - and here the measurement is
+    // usually available, because a user opens this tool while Antigravity is
+    // running.
+    if egress::vpn_verdict(egress::detect().as_ref()).0 {
         // Takes the pinned block with it - `remove_dns_nrpt` owns both, because
         // the addresses only ever existed to serve the rules.
         remove_dns_nrpt();
@@ -704,6 +756,7 @@ mod tests {
         let o = DnsOutcome {
             vpn_active: true,
             stood_down_for_vpn: true,
+            client: egress::ClientEgress::Tunnel,
             via_relay: true,
             pinned: Vec::new(),
             pin_error: None,
@@ -716,6 +769,47 @@ mod tests {
         // The relay/probe/takeover lines belong to a run that wrote rules.
         assert!(!note.contains("релей"), "{}", note);
         assert!(!note.contains("Забраны правила"), "{}", note);
+    }
+
+    /// The G29 case, from the other side: a tunnel is up, the client was
+    /// measured going around it, so the rules **were** written. Seeing "VPN"
+    /// and created rules in the same run reads as a contradiction unless the
+    /// note explains it, so it must be there and it must not be the stand-down
+    /// text.
+    #[test]
+    fn a_client_outside_the_tunnel_is_told_why_rules_were_written() {
+        let with = |client| DnsOutcome {
+            vpn_active: true,
+            stood_down_for_vpn: false,
+            client,
+            via_relay: false,
+            pinned: Vec::new(),
+            pin_error: None,
+            taken_over: Vec::new(),
+            probe_gave_up: false,
+        };
+
+        let excluded = outcome_note(&with(egress::ClientEgress::Physical)).expect("сообщение");
+        assert!(excluded.contains("мимо него"), "{}", excluded);
+        assert!(excluded.contains("400"), "{}", excluded);
+        assert!(!excluded.contains("не создавались"), "{}", excluded);
+
+        // Antigravity was not running: the rules still go in, and the note says
+        // the measurement is what is missing rather than claiming either way.
+        let unknown = outcome_note(&with(egress::ClientEgress::Unknown)).expect("сообщение");
+        assert!(unknown.contains("не запущен"), "{}", unknown);
+        assert!(!unknown.contains("не создавались"), "{}", unknown);
+
+        // No tunnel at all: nothing to explain, so nothing is said about one.
+        let plain = DnsOutcome {
+            vpn_active: false,
+            ..with(egress::ClientEgress::Unknown)
+        };
+        assert!(
+            outcome_note(&plain).map_or(true, |n| !n.contains("VPN")),
+            "{:?}",
+            outcome_note(&plain)
+        );
     }
 
     #[test]

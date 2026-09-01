@@ -851,8 +851,13 @@ enum Heat {
     ControlReference(Vec<IpAddr>),
 }
 
-/// Whether a tunnel is carrying this machine's traffic, as last seen by the
+/// Whether a tunnel is carrying **the client's** traffic, as last seen by the
 /// relay's warm loop (`VPN_CHECK_EVERY`).
+///
+/// The client's, not the machine's: a tunnel that holds a default route but
+/// excludes `language_server.exe` must leave substitution on, or the rules
+/// resolve to genuine Google and the gate answers 400 with the layer nominally
+/// installed (G29). `egress::vpn_verdict` is what decides; this only stores it.
 ///
 /// A plain flag rather than a parameter threaded through six call sites, and a
 /// flag the *relay* sets rather than something this module probes: detection
@@ -1746,6 +1751,90 @@ mod tests {
                 assert!(
                     !REFERENCE_V4.contains(s),
                     "{} is a reference resolver, not a substituter",
+                    s
+                );
+            }
+        }
+    }
+
+    /// Live: the whole pool, provider by provider and name by name — what each
+    /// answered, what proxy set was learned for it, and the verdict that follows.
+    ///
+    /// This is the quarterly re-measurement P14 asks for, in one command. It
+    /// asserts nothing about *who* substitutes what, because that is exactly the
+    /// thing that changes without warning and must not be pinned in a test (N15:
+    /// a measurement recorded as a property of a host outlived the measurement by
+    /// months). It only pins the two rules that are ours: an NRPT fallback never
+    /// names a reference resolver, and never names a DoH provider (I49).
+    ///
+    ///     cargo test the_pool_measured_provider_by_provider -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a live network, VPN off; run with --ignored"]
+    fn the_pool_measured_provider_by_provider() {
+        const NAMES: &[&str] = &[
+            "cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+            "generativelanguage.googleapis.com",
+        ];
+
+        ensure_proxy_sets_learned(0);
+        println!("learned proxy sets:");
+        for (idx, p) in PROVIDERS.iter().enumerate() {
+            println!("  {:<12} {:?}", p.name, known_proxy_addrs(idx));
+        }
+
+        for name in NAMES {
+            let query = dns_client::build_query(name, 0x6767);
+            let mut reference: Vec<IpAddr> = Vec::new();
+            for server in REFERENCE_V4 {
+                if let Ok(ip) = server.parse::<Ipv4Addr>() {
+                    if let Ok(reply) = dns_client::query_raw_via(&query, ip, 0, QUERY_TIMEOUT) {
+                        reference.extend(dns_client::answer_addrs(&reply));
+                    }
+                }
+            }
+            println!("\n{}\n  reference {:?}", name, reference);
+            for (idx, p) in PROVIDERS.iter().enumerate() {
+                let known = known_proxy_addrs(idx);
+                match ask_provider(p, &query, 0, QUERY_TIMEOUT) {
+                    None => println!("  {:<12} нет ответа", p.name),
+                    Some(reply) => {
+                        let addrs = dns_client::answer_addrs(&reply);
+                        // Wire counts alongside the parsed addresses: an empty
+                        // list with ANCOUNT>0 is a parse problem, an empty list
+                        // with ANCOUNT=0 is the provider (G24 was the first).
+                        let rcode = reply.get(3).map_or(0xFF, |b| b & 0x0F);
+                        let ancount = if reply.len() >= 8 {
+                            u16::from_be_bytes([reply[6], reply[7]])
+                        } else {
+                            0
+                        };
+                        // Both verdicts: the bootstrap one the relay may act on,
+                        // and the stricter one an NRPT fallback needs.
+                        println!(
+                            "  {:<12} rcode={} an={} len={} {:?} -> race {:?}, rule {}",
+                            p.name,
+                            rcode,
+                            ancount,
+                            reply.len(),
+                            addrs,
+                            classify(&addrs, &reference, &known),
+                            if known.is_empty() {
+                                "исключён (прокси-набор не выучен)".to_string()
+                            } else {
+                                format!("{:?}", classify(&addrs, &reference, &known))
+                            }
+                        );
+                    }
+                }
+            }
+            for s in substituting_addrs(name, 0) {
+                assert!(!REFERENCE_V4.contains(&s), "{} is a reference resolver", s);
+                assert!(
+                    PROVIDERS
+                        .iter()
+                        .any(|p| p.v4.contains(&s) && !matches!(p.transport, Transport::Doh(_))),
+                    "{} is not a UDP provider address (I49)",
                     s
                 );
             }

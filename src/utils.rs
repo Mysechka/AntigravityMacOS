@@ -46,9 +46,11 @@ pub fn powershell(script: &str) -> Option<std::process::Output> {
     powershell_within(script, PS_LIMIT)
 }
 
-/// The same, with the limit given explicitly so the timeout itself is testable
-/// without waiting a minute for it.
-fn powershell_within(script: &str, limit: Duration) -> Option<std::process::Output> {
+/// The same, with the limit given explicitly. Public because `PS_LIMIT` is sized
+/// for the CIM cmdlets that write rules, and a read-only probe on a path the user
+/// is watching should not be allowed a whole minute of silence; it also makes the
+/// timeout itself testable without waiting that minute.
+pub fn powershell_within(script: &str, limit: Duration) -> Option<std::process::Output> {
     let mut cmd = Command::new("powershell");
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     bounded_output(no_window(&mut cmd), limit)

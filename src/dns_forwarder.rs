@@ -346,31 +346,42 @@ fn warm_forever() {
     let mut since_exits = PROBE_HEALTHY_EVERY;
     let mut since_vpn = VPN_CHECK_EVERY;
     loop {
-        // First, because everything below depends on it: with a tunnel up the
-        // relay stops substituting and answers as the tunnel's own resolver
-        // would. The rules cannot be removed from here - the task runs at
-        // `RunLevel Limited` and NRPT needs an administrator - so the relay
-        // changes what it *answers* instead, which needs no privilege and
+        // First, because everything below depends on it: when a tunnel carries
+        // the client the relay stops substituting and answers as the tunnel's
+        // own resolver would. The rules cannot be removed from here - the task
+        // runs at `RunLevel Limited` and NRPT needs an administrator - so the
+        // relay changes what it *answers* instead, which needs no privilege and
         // reaches the same place. Menu 1 removes the rules outright on the next
         // elevated run (`dns::refresh_pinned_hosts`).
         if since_vpn >= VPN_CHECK_EVERY {
-            let up = egress::detect().is_some_and(|e| e.vpn_active);
-            if up != resolvers::vpn_is_active() {
-                log(&format!(
-                    "VPN {} — {}",
-                    if up {
-                        "поднят"
-                    } else {
-                        "отключён"
+            // Not "is a tunnel up" but "is the client in it" - a tunnel the
+            // client is excluded from must not turn substitution off, or the
+            // rules menu 1 wrote resolve to genuine Google and the gate answers
+            // 400 with the whole layer nominally installed (G29). This is also
+            // where the excluded case repairs itself: the rules are already in
+            // place, and within one interval of Antigravity starting the relay
+            // sees its sockets on the ISP link and starts substituting again.
+            let eg = egress::detect();
+            let (stand_down, client) = egress::vpn_verdict(eg.as_ref());
+            if stand_down != resolvers::vpn_is_active() {
+                log(
+                    &match (stand_down, eg.is_some_and(|e| e.vpn_active), client) {
+                        (true, _, _) => {
+                            "VPN поднят — подмена выключена, DNS идёт как настроил VPN".to_string()
+                        }
+                        (false, true, egress::ClientEgress::Physical) => {
+                            "VPN поднят, но трафик Antigravity идёт мимо него — подмена включена"
+                                .to_string()
+                        }
+                        (false, true, _) => {
+                            "VPN поднят, маршрут Antigravity неизвестен — подмена включена"
+                                .to_string()
+                        }
+                        (false, false, _) => "VPN отключён — подмена снова включена".to_string(),
                     },
-                    if up {
-                        "подмена выключена, DNS идёт как настроил VPN"
-                    } else {
-                        "подмена снова включена"
-                    }
-                ));
+                );
             }
-            resolvers::set_vpn_active(up);
+            resolvers::set_vpn_active(stand_down);
             since_vpn = Duration::ZERO;
         }
         let egress = isp_interface();
