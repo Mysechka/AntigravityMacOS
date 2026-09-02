@@ -429,7 +429,10 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done.load(std::sync::atomic::Ordering::SeqCst) {
-            assert!(Instant::now() < deadline, "order() deadlocked on its own table");
+            assert!(
+                Instant::now() < deadline,
+                "order() deadlocked on its own table"
+            );
             std::thread::sleep(ms(10));
         }
     }

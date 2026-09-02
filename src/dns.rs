@@ -40,16 +40,19 @@ const AG_NRPT_LEGACY_TAGS: &[&str] = &["AG_UNLOCKER_NRPT"];
 // changed. `antigravity-unleash` stays out: still genuine everywhere.
 //
 // `daily-cloudcode-pa` stays because it is the same service by another name and
-// two providers reach it; `generativelanguage` is the Gemini CLI path.
+// two providers reach it. `generativelanguage` and `aistudio.google.com` are
+// **deliberately absent** (owner, `_4`): both were only ever routed for the
+// Gemini CLI flow, the IDE was measured running a full agentic task with the
+// `generativelanguage` rule removed, and another of the owner's tools owns those
+// two names now. We neither install them nor take them away - `remove_dns_nrpt`
+// works off `all_tags()`, so it only ever removes rules carrying our own tag and
+// a foreign rule on either name is left alone (so is a subtree rule, I44).
 // Everything else Antigravity talks to - oauth2/www/play/accounts and
 // jetski-webchannel - works on real Google and is deliberately not listed.
 const AG_NRPT_CORE: &[&str] = &[
     "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
-    "generativelanguage.googleapis.com",
 ];
-// Only needed for the Gemini CLI flow (the API-key page must open in a browser).
-const AG_NRPT_GEMINI: &[&str] = &["aistudio.google.com"];
 
 /// The names an NRPT rule always points at the relay - and therefore the ones
 /// the relay keeps a fresh answer for. Warming anything else would put queries
@@ -398,8 +401,6 @@ fn pin_substituted_hosts(namespaces: &[&str], if_index: u32) -> Result<Vec<Strin
     Ok(pinned)
 }
 
-/// `include_gemini` additionally routes the AI Studio API-key page, which is
-/// only relevant to the Gemini CLI flow.
 /// One character of progress on the caller's line.
 fn tick() {
     use std::io::Write;
@@ -432,12 +433,12 @@ const HELPER_LIMIT: Duration = Duration::from_secs(15);
 /// this reports "not done" so the caller can say so rather than half-running the
 /// Windows path.
 #[cfg(not(target_os = "windows"))]
-pub fn setup_dns_nrpt_with(_include_gemini: bool) -> Result<DnsOutcome, String> {
+pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
     Err("DNS-слой на Linux пока не портирован".to_string())
 }
 
 #[cfg(target_os = "windows")]
-pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
+pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
     // Remove any of our previous rules to keep a clean idempotent state.
     remove_dns_nrpt();
 
@@ -489,10 +490,7 @@ pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<DnsOutcome, String> {
         });
     }
 
-    let mut namespaces: Vec<&str> = AG_NRPT_CORE.to_vec();
-    if include_gemini {
-        namespaces.extend_from_slice(AG_NRPT_GEMINI);
-    }
+    let namespaces: Vec<&str> = AG_NRPT_CORE.to_vec();
 
     // Before ours go in: a leftover rule from another tool on the same name wins
     // silently and would make everything below pointless for that name.
@@ -703,7 +701,7 @@ fn fallback_note(o: &DnsOutcome) -> Option<String> {
 /// elevated start of the unlocker.
 ///
 /// Two jobs, and the first one is new: **a VPN that came up after the machine
-/// was patched takes the rules back off.** `setup_dns_nrpt_with` refuses to
+/// was patched takes the rules back off.** `setup_dns_nrpt` refuses to
 /// install them while a tunnel is up, but that only covers the machine's state
 /// at patch time; a user who connects a VPN afterwards would otherwise keep
 /// overriding their own resolver for three names indefinitely. Returns the
@@ -722,7 +720,7 @@ pub fn refresh_pinned_hosts() {
     if !is_nrpt_applied() {
         return;
     }
-    // Same evidence rule as `setup_dns_nrpt_with`, and it matters more here: this
+    // Same evidence rule as `setup_dns_nrpt`, and it matters more here: this
     // runs unattended on every elevated start, so reading "a tunnel is up" as
     // "the client is in it" would quietly strip a working configuration off a
     // machine whose client is excluded from that tunnel (G29). Rules are removed
@@ -825,8 +823,8 @@ mod tests {
     /// Windows writes names with a trailing dot; that is the same name.
     #[test]
     fn a_trailing_dot_still_matches() {
-        let found = parse_conflicts("generativelanguage.googleapis.com.|OTHER\n", AG_NRPT_CORE);
-        assert_eq!(found, vec!["generativelanguage.googleapis.com (OTHER)"]);
+        let found = parse_conflicts("cloudcode-pa.googleapis.com.|OTHER\n", AG_NRPT_CORE);
+        assert_eq!(found, vec!["cloudcode-pa.googleapis.com (OTHER)"]);
     }
 
     /// A leading dot is a subtree rule, which our exact-name rule already

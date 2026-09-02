@@ -32,7 +32,6 @@ mod health;
 mod hosts_pin;
 mod ls_log;
 mod patch_binary;
-mod patch_gemini;
 mod patch_ide;
 mod proxy;
 mod resolvers;
@@ -43,13 +42,10 @@ mod watchdog;
 
 use asar::extract_asar;
 use auth::login_screen;
-use dns::{is_nrpt_applied, refresh_pinned_hosts, remove_dns_nrpt, setup_dns_nrpt_with};
+use dns::{is_nrpt_applied, refresh_pinned_hosts, remove_dns_nrpt, setup_dns_nrpt};
 use patch_binary::{kill_affected_processes, patch_all_binaries, unpatch_all_binaries};
-use patch_gemini::run_gemini_patcher;
 use patch_ide::{is_new_desktop_architecture, patch_desktop, patch_extension_js, patch_ide};
-use utils::{
-    clear_screen, is_admin, link, mask_path, open_hint, open_url, print_results, prompt, short_path,
-};
+use utils::{clear_screen, is_admin, link, mask_path, open_url, print_results, prompt, short_path};
 
 // Title shown at the top of the main menu.
 const APP_TITLE: &str = "Antigravity Unlocker 2";
@@ -201,7 +197,7 @@ fn standard_install_candidates() -> Vec<PathBuf> {
 /// Linux lands in one of the system prefixes (`.deb` → `/usr/share` or `/opt`;
 /// tarball → `/opt` or under the home dir) with the language server at
 /// `resources/app/extensions/antigravity/bin/`. The CLI keeps a per-user `agy`
-/// tree. Anything not covered here is reachable through menu 3 (manual path),
+/// tree. Anything not covered here is reachable through menu 2 (manual path),
 /// which is why this list can stay short rather than scanning the whole disk.
 #[cfg(not(target_os = "windows"))]
 fn standard_install_candidates() -> Vec<PathBuf> {
@@ -493,24 +489,11 @@ fn binary_failure_message(summary: &patch_binary::BinarySummary) -> String {
     }
 }
 
-fn is_gemini_cli_installed() -> bool {
-    if let Ok(appdata) = env::var("APPDATA") {
-        let path = PathBuf::from(appdata)
-            .join("npm")
-            .join("node_modules")
-            .join("@google")
-            .join("gemini-cli");
-        path.exists() && path.is_dir()
-    } else {
-        false
-    }
-}
-
 /// Starts the background resolver and installs the NRPT rules. Order matters:
 /// the nameserver the rules point at depends on whether the relay is running,
 /// so it has to be up before they are written.
 #[cfg(not(target_os = "windows"))]
-fn apply_dns_patch(_include_gemini: bool) {
+fn apply_dns_patch() {
     // Phase-2 region route (kb/patch.md): start the local CONNECT proxy as a
     // systemd user unit and point the language server at it via HTTPS_PROXY. The
     // proxy carries the gate hosts through a permitted-region exit, so the
@@ -526,6 +509,22 @@ fn apply_dns_patch(_include_gemini: bool) {
             return;
         }
     }
+    // The unit started is not the port bound (`proxy::bind_listener` retries a
+    // port something else may hold). Same rule as on Windows, and it matters more
+    // here: nothing on Linux takes the variable back off, so a drop-in naming a
+    // dead socket would break the whole session's proxy-aware traffic (G31, I53).
+    print!("Проверяем локальный прокси... ");
+    io::stdout().flush().ok();
+    if !proxy::wait_for_listener(Duration::from_secs(20)) {
+        println!("\x1b[33mне отвечает\x1b[0m\x1b[92m");
+        println!("  HTTPS_PROXY не прописана — иначе без сети остались бы все");
+        println!("  программы, которые её читают. Обход 400 не включён.");
+        // Only our own drop-in; a proxy the user set another way is not ours to
+        // touch and this call cannot reach it.
+        endpoint::remove_proxy(&proxy::proxy_url(), "").ok();
+        return;
+    }
+    println!("OK");
     print!("Прописываем HTTPS_PROXY для Antigravity... ");
     io::stdout().flush().ok();
     match endpoint::apply_proxy(&proxy::proxy_url(), "") {
@@ -543,7 +542,7 @@ fn apply_dns_patch(_include_gemini: bool) {
 }
 
 #[cfg(target_os = "windows")]
-fn apply_dns_patch(include_gemini: bool) {
+fn apply_dns_patch() {
     print!("\nФоновый DNS-резолвер... ");
     io::stdout().flush().ok();
     match background::ensure_running() {
@@ -554,7 +553,7 @@ fn apply_dns_patch(include_gemini: bool) {
 
     print!("Патч для Google серверов... ");
     io::stdout().flush().ok();
-    match setup_dns_nrpt_with(include_gemini) {
+    match setup_dns_nrpt() {
         Ok(outcome) => {
             println!("OK");
             if let Some(note) = dns::outcome_note(&outcome) {
@@ -565,7 +564,7 @@ fn apply_dns_patch(include_gemini: bool) {
     }
 }
 
-/// Menu 6: undoes the DNS half of the patch and nothing else, so the binaries
+/// Menu 5: undoes the DNS half of the patch and nothing else, so the binaries
 /// stay patched.
 fn handle_restore_dns() {
     print!("Удаление фоновой DNS-службы... ");
@@ -629,11 +628,8 @@ fn ask_for_own_proxy() {
     println!(
         "\x1b[38;5;154mСвой прокси за рубежом — если он у вас есть (необязательно)\x1b[0m\x1b[92m"
     );
-    println!("  Трафик Antigravity к серверам Google пойдёт через него. Это самый");
-    println!("  быстрый и надёжный путь, потому что прокси ваш, а не чужой.");
-    println!("  Формат:  адрес:порт          например  127.0.0.1:1371");
-    println!("  С паролем:  логин:пароль@адрес:порт");
-    println!("  Нужен HTTP-прокси (не SOCKS).");
+    println!("  Трафик Antigravity к Google пойдёт через него — это самый быстрый путь.");
+    println!("  HTTP-прокси (не SOCKS): адрес:порт или логин:пароль@адрес:порт");
     match &current {
         Some(up) => {
             println!("  Сейчас задан: {}", up.display());
@@ -721,7 +717,7 @@ fn save_own_proxy(up: &upstream::Upstream) {
 ///
 /// Gated on the certificate file rather than on `ca_is_trusted()`, which costs a
 /// PowerShell call: every machine that has the root also still has the file, and
-/// the file-deleted-by-hand case is still covered by menu 6 and menu 7.
+/// the file-deleted-by-hand case is still covered by menu 4 and menu 5.
 ///
 /// **Must run only once the installed relay is this build, and never before.**
 /// An out-of-date relay is by definition one that still terminates TLS, signs
@@ -816,149 +812,18 @@ fn handle_revert_all() {
         Err(e) => println!("\x1b[33mошибка: {}\x1b[0m\x1b[92m", e),
     }
 
-    // The variables come out here too, not only in menu 6. This is the path a
+    // The variables come out here too, not only in menu 4. This is the path a
     // user takes when they want their machine back, and it was the one leaving
     // `HTTPS_PROXY` pointing at a port it had just deleted.
     disable_fallback_proxy();
 
     // The user's own proxy address is our configuration file, so a full revert
-    // takes it with everything else. Menu 6 deliberately leaves it: that only
+    // takes it with everything else. Menu 5 deliberately leaves it: that only
     // stops the DNS service, the setting is inert without the relay process
     // anyway, and pressing 1 again should not mean typing it in again.
     upstream::clear();
 
     print_results(&reverted, &[]);
-}
-
-fn is_valid_gemini_api_key(key: &str) -> bool {
-    key.trim().starts_with("AIzaSy") && key.trim().len() == 39
-}
-
-fn get_system_gcloud_project() -> Option<String> {
-    if let Ok(proj) = env::var("GOOGLE_CLOUD_PROJECT") {
-        if !proj.is_empty() {
-            return Some(proj.trim().to_string());
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let out = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "[Environment]::GetEnvironmentVariable('GOOGLE_CLOUD_PROJECT', 'User')",
-            ])
-            .output()
-            .ok()?;
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !stdout.is_empty() {
-                return Some(stdout);
-            }
-        }
-    }
-    let settings_path = format!(
-        "{}\\.gemini\\settings.json",
-        env::var("USERPROFILE").unwrap_or_default()
-    );
-    if let Ok(content) = std::fs::read_to_string(&settings_path) {
-        if let Some(start) = content.find(r#""project":""#) {
-            let remainder = &content[start + 11..];
-            if let Some(end) = remainder.find('"') {
-                let proj = &remainder[..end];
-                if !proj.is_empty() {
-                    return Some(proj.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-fn is_valid_project_id(proj: &str) -> bool {
-    let p = proj.trim();
-    if p.is_empty() || p.len() < 4 || p.len() > 30 {
-        return false;
-    }
-    p.chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-fn update_settings_project_id(project_id: &str) -> Result<(), String> {
-    let settings_path = format!(
-        "{}\\.gemini\\settings.json",
-        env::var("USERPROFILE").unwrap_or_default()
-    );
-    if !std::path::Path::new(&settings_path).exists() {
-        let settings_dir = format!("{}\\.gemini", env::var("USERPROFILE").unwrap_or_default());
-        std::fs::create_dir_all(&settings_dir)
-            .map_err(|e| format!("Не удалось создать директорию {}: {}", settings_dir, e))?;
-
-        let default_content = format!("{{\n  \"project\": \"{}\"\n}}", project_id);
-        std::fs::write(&settings_path, default_content)
-            .map_err(|e| format!("Не удалось записать settings.json: {}", e))?;
-        return Ok(());
-    }
-
-    let content = std::fs::read_to_string(&settings_path)
-        .map_err(|e| format!("Не удалось прочитать settings.json: {}", e))?;
-
-    let new_content = if content.contains(r#""project":"#) {
-        if let Some(start) = content.find(r#""project":"#) {
-            let remainder = &content[start + 10..];
-            if let Some(quote_start) = remainder.find('"') {
-                let after_quote = &remainder[quote_start + 1..];
-                if let Some(quote_end) = after_quote.find('"') {
-                    let before = &content[..start + 10 + quote_start + 1];
-                    let after = &after_quote[quote_end..];
-                    format!("{}{}{}", before, project_id, after)
-                } else {
-                    content.clone()
-                }
-            } else {
-                content.clone()
-            }
-        } else {
-            content.clone()
-        }
-    } else {
-        if let Some(pos) = content.find('{') {
-            let (before, after) = content.split_at(pos + 1);
-            format!("{}\n  \"project\": \"{}\",{}", before, project_id, after)
-        } else {
-            content.clone()
-        }
-    };
-
-    std::fs::write(&settings_path, new_content)
-        .map_err(|e| format!("Не удалось обновить settings.json: {}", e))?;
-    Ok(())
-}
-
-fn get_system_gemini_api_key() -> Option<String> {
-    if let Ok(key) = env::var("GEMINI_API_KEY") {
-        if is_valid_gemini_api_key(&key) {
-            return Some(key.trim().to_string());
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let out = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "[Environment]::GetEnvironmentVariable('GEMINI_API_KEY', 'User')",
-            ])
-            .output()
-            .ok()?;
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if is_valid_gemini_api_key(&stdout) {
-                return Some(stdout);
-            }
-        }
-    }
-    None
 }
 
 fn handle_patch_antigravity() {
@@ -1007,7 +872,7 @@ fn handle_patch_antigravity() {
     if did_something && is_admin() {
         // Unconditionally, not only on a fresh machine: this run has to bring the
         // relay up and re-point the rules at it even when the rules already exist.
-        apply_dns_patch(false);
+        apply_dns_patch();
         // Register the standalone watchdog task too, so re-patch-on-update
         // survives the relay being stopped or dying (G9). Best-effort.
         let _ = background::enable_watchdog();
@@ -1018,7 +883,7 @@ fn handle_patch_antigravity() {
     // patch, not behind an is_admin gate.
     #[cfg(not(target_os = "windows"))]
     if did_something {
-        apply_dns_patch(false);
+        apply_dns_patch();
     }
 
     // Last, and never earlier: the CA may only go once the relay that signs with
@@ -1037,6 +902,9 @@ fn handle_patch_antigravity() {
         {
             reconcile_gate_proxy();
             advise_on_exit();
+            // No admin banner here. The warning is given up front, on the first
+            // screen of an unelevated run (`show_admin_prewarning`), where the
+            // user can still act on it without having patched anything.
         }
     }
 
@@ -1093,6 +961,13 @@ fn advise_on_exit() {
 /// in Antigravity's settings, means every request already goes where they want
 /// it, and this tool gets out of the way. Whether the language server honours
 /// the settings.json value is unverified, so it is treated as intent regardless.
+///
+/// And the listener comes before both: the variable is only ever set once
+/// something actually answers on that port (G31, I53). A run without admin rights
+/// installs no relay and therefore no proxy, and pointing a user-wide variable at
+/// a socket nobody holds is worse than doing nothing - the language server proxies
+/// its sign-in too, so `oauth2.googleapis.com` fails with `connection refused` and
+/// the user cannot even log in.
 fn reconcile_gate_proxy() {
     let url = proxy::proxy_url();
     if let Some(theirs) = endpoint::foreign_proxy(&url) {
@@ -1104,6 +979,14 @@ fn reconcile_gate_proxy() {
         // Ours must not sit above theirs (User scope beats Machine scope).
         let ca = proxy::ca_cert_path().to_string_lossy().to_string();
         endpoint::remove_proxy(&url, &ca).ok();
+        return;
+    }
+    // Short budget on purpose: the relay was started a few steps ago and the
+    // own-proxy question has been on screen since, so a healthy listener has long
+    // been up. A slow one (the port was briefly taken) is picked up by the relay
+    // itself, which sets the variable the moment its bind succeeds.
+    if !proxy::wait_for_listener(Duration::from_secs(2)) {
+        report_gate_proxy_down(&url);
         return;
     }
     match endpoint::apply_proxy(&url, "") {
@@ -1118,6 +1001,44 @@ fn reconcile_gate_proxy() {
         }
         Err(e) => println!("\x1b[33m{}\x1b[0m\x1b[92m", e),
     }
+}
+
+/// Says why the local proxy is not being wired up, and makes sure no value of
+/// ours is left naming it.
+///
+/// Two different failures land here and they need different answers. Without
+/// admin rights there is no relay and never was one, so the honest line is "the
+/// server-side half was skipped, run me elevated". With admin rights the relay is
+/// there and the socket is not, which is a port problem - 53129 lives inside
+/// Windows' dynamic range and can be taken, or reserved by Hyper-V/WSL - so the
+/// answer is where to look. In both cases a value left over from an earlier run
+/// would keep the machine's proxy-aware traffic pointed at nothing (G31), so it
+/// comes off first, and only ever when it is ours (I45).
+fn report_gate_proxy_down(url: &str) {
+    let ca = proxy::ca_cert_path().to_string_lossy().to_string();
+    if let Ok(true) = endpoint::remove_proxy_if_ours(url, &ca) {
+        println!("Снята старая переменная HTTPS_PROXY — она указывала на неработающий прокси.");
+        println!("  Без этого Antigravity не смог бы даже войти в аккаунт.");
+    }
+    if !is_admin() {
+        // One line only: the full explanation was the first screen of this run
+        // (`show_admin_prewarning`), and repeating it here would say nothing new.
+        println!(
+            "\x1b[33mЛокальный прокси не запущен — нужны права администратора.\x1b[0m\x1b[92m"
+        );
+        return;
+    }
+    println!(
+        "\x1b[33mЛокальный прокси не отвечает на {} — переменная HTTPS_PROXY не выставлена.\x1b[0m\x1b[92m",
+        url
+    );
+    println!("  Иначе без сети остались бы все программы, которые её читают.");
+    println!(
+        "  Причина — в журнале: {} (строки «proxy»).",
+        mask_path(&dns_forwarder::log_path().to_string_lossy())
+    );
+    println!("  Чаще всего порт занят другой программой или зарезервирован Hyper-V/WSL:");
+    println!("  netsh int ipv4 show excludedportrange protocol=tcp");
 }
 
 /// Which product an install directory is, for the progress line.
@@ -1135,229 +1056,6 @@ fn install_label(install: &Path) -> &'static str {
     } else {
         "Antigravity 2.0"
     }
-}
-
-fn handle_patch_gemini() {
-    kill_affected_processes();
-    let gemini_cli_exists = is_gemini_cli_installed();
-
-    if !gemini_cli_exists {
-        println!("{}", "Gemini CLI не найден.");
-        thread::sleep(Duration::from_secs(2));
-        return;
-    }
-
-    let mut successes = Vec::new();
-    let mut failures = Vec::new();
-
-    let mut api_key = String::new();
-
-    // The Gemini flow points the user at the AI Studio key page, so that host
-    // is routed too.
-    if is_admin() {
-        apply_dns_patch(true);
-    }
-
-    let existing_key = get_system_gemini_api_key();
-    const API_KEYS_URL: &str = "https://aistudio.google.com/app/u/1/api-keys";
-
-    println!("\n============================================================");
-    println!("Gemini CLI (forbidden necromancy)");
-    println!("Требуется: AIzaSy-ключ из");
-    println!(
-        "  {}",
-        link(API_KEYS_URL, "aistudio.google.com/app/u/1/api-keys")
-    );
-    println!("  {}", open_hint("open"));
-    println!();
-
-    if let Some(ref ext_key) = existing_key {
-        let masked = format!("{}***{}", &ext_key[..6], &ext_key[ext_key.len() - 4..]);
-        println!(
-            "  - Нажмите Enter для использования сохраненного ключа ({})",
-            masked
-        );
-        println!("  - Или введите 'skip' для сброса ключа и перехода к браузерному OAuth");
-        println!("  - Или вставьте новый AIzaSy-ключ");
-    } else {
-        println!("  - Вставьте AIzaSy-ключ");
-        println!(
-            "  - Или нажмите Enter (пустая строка) для пропуска (авторизация через браузер/OAuth)"
-        );
-    }
-    println!("------------------------------------------------------------");
-
-    loop {
-        print!("> ");
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap_or(0);
-        let key_input = input.trim().to_string();
-
-        print!("\x1b[1A\x1b[2K");
-        io::stdout().flush().unwrap();
-
-        if key_input.eq_ignore_ascii_case("open") || key_input.eq_ignore_ascii_case("o") {
-            open_url(API_KEYS_URL);
-            println!("> (страница открыта в браузере)");
-            continue;
-        }
-
-        if key_input.is_empty() {
-            if let Some(ref ext_key) = existing_key {
-                api_key = ext_key.clone();
-                let masked = format!("{}***{}", &api_key[..6], &api_key[api_key.len() - 4..]);
-                println!("> {}", masked);
-                println!("Используется сохраненный API-ключ.");
-            } else {
-                println!("> (пропущено - будет использоваться авторизация через браузер/OAuth)");
-            }
-            break;
-        }
-
-        if key_input.to_lowercase() == "skip" || key_input.to_lowercase() == "oauth" {
-            println!("> (сброшено - будет использоваться авторизация через браузер/OAuth)");
-            api_key = String::new();
-            break;
-        }
-
-        if is_valid_gemini_api_key(&key_input) {
-            api_key = key_input;
-            let masked = format!("{}***{}", &api_key[..6], &api_key[api_key.len() - 4..]);
-            println!("> {}", masked);
-            println!("API-ключ получен.");
-            break;
-        } else {
-            println!("> (неверный формат)");
-            println!("\x1b[33m[ERR] Неверный формат API-ключа. Ожидается: AIzaSy (39 символов).\x1b[0m\x1b[92m");
-        }
-    }
-
-    let mut project_id = String::new();
-    let existing_project = get_system_gcloud_project();
-    const PROJECT_URL: &str = "https://aistudio.google.com/app/apikey";
-
-    println!("\n============================================================");
-    println!("Google Cloud Project ID (Идентификатор проекта)");
-    println!("Требуется для работы OAuth (авторизации через браузер).");
-    println!("Вы можете получить его из:");
-    println!("  {}", link(PROJECT_URL, "aistudio.google.com/app/apikey"));
-    println!("  (кликните на имя проекта или шестеренку у вашего ключа)");
-    println!("  {}", open_hint("open"));
-    println!();
-
-    if let Some(ref ext_proj) = existing_project {
-        println!(
-            "  - Нажмите Enter для использования сохраненного Project ID ({})",
-            ext_proj
-        );
-        println!("  - Или введите 'skip' для сброса и использования дефолтного cloudshell-gca");
-        println!("  - Или введите новый Project ID");
-    } else {
-        println!("  - Введите Project ID");
-        println!("  - Или нажмите Enter для пропуска (будет использован дефолтный cloudshell-gca)");
-    }
-    println!("------------------------------------------------------------");
-
-    loop {
-        print!("> ");
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap_or(0);
-        let proj_input = input.trim().to_string();
-
-        print!("\x1b[1A\x1b[2K");
-        io::stdout().flush().unwrap();
-
-        if proj_input.eq_ignore_ascii_case("open") || proj_input.eq_ignore_ascii_case("o") {
-            open_url(PROJECT_URL);
-            println!("> (страница открыта в браузере)");
-            continue;
-        }
-
-        if proj_input.is_empty() {
-            if let Some(ref ext_proj) = existing_project {
-                project_id = ext_proj.clone();
-                println!("> {}", project_id);
-                println!("Используется сохраненный Project ID.");
-            } else {
-                println!("> (пропущено - по умолчанию cloudshell-gca)");
-            }
-            break;
-        }
-
-        if proj_input.to_lowercase() == "skip" || proj_input.to_lowercase() == "default" {
-            println!("> (сброшено - по умолчанию cloudshell-gca)");
-            project_id = String::new();
-            break;
-        }
-
-        if is_valid_project_id(&proj_input) {
-            project_id = proj_input;
-            println!("> {}", project_id);
-            println!("Project ID получен.");
-            break;
-        } else {
-            println!("> (неверный формат)");
-            println!("\x1b[33m[ERR] Неверный формат Project ID. Ожидается: от 4 до 30 символов, строчные латинские буквы, цифры и дефис.\x1b[0m\x1b[92m");
-        }
-    }
-
-    println!("{}", "--------------------------------------------------");
-    println!("Разблокировка Gemini CLI...");
-
-    let set_gemini = if !api_key.is_empty() {
-        format!(
-            "[Environment]::SetEnvironmentVariable('GEMINI_API_KEY', '{}', 'User')",
-            api_key
-        )
-    } else {
-        "[Environment]::SetEnvironmentVariable('GEMINI_API_KEY', $null, 'User')".to_string()
-    };
-    Command::new("powershell")
-        .args(["-NoProfile", "-Command", &set_gemini])
-        .output()
-        .ok();
-
-    let set_project = if !project_id.is_empty() {
-        format!(
-            "[Environment]::SetEnvironmentVariable('GOOGLE_CLOUD_PROJECT', '{}', 'User')",
-            project_id
-        )
-    } else {
-        "[Environment]::SetEnvironmentVariable('GOOGLE_CLOUD_PROJECT', $null, 'User')".to_string()
-    };
-    Command::new("powershell")
-        .args(["-NoProfile", "-Command", &set_project])
-        .output()
-        .ok();
-
-    if !project_id.is_empty() {
-        if let Err(e) = update_settings_project_id(&project_id) {
-            println!(
-                "\x1b[33m[ERR] Не удалось обновить settings.json: {}\x1b[0m\x1b[92m",
-                e
-            );
-        }
-    }
-
-    match run_gemini_patcher() {
-        Ok(_) => {
-            println!("[OK] Gemini CLI успешно разблокирован!");
-            successes.push("Gemini CLI".to_string());
-        }
-        Err(e) => {
-            println!(
-                "\x1b[33m[ERR] Ошибка разблокировки Gemini CLI: {}\x1b[0m\x1b[92m",
-                e
-            );
-            failures.push(format!("Gemini CLI - {}", e));
-        }
-    }
-
-    print_results(&successes, &failures);
 }
 
 fn handle_manual_path() {
@@ -1425,12 +1123,12 @@ fn handle_manual_path() {
     if did_something && is_admin() {
         // Unconditionally, not only on a fresh machine: this run has to bring the
         // relay up and re-point the rules at it even when the rules already exist.
-        apply_dns_patch(false);
+        apply_dns_patch();
     }
     // Linux: the proxy route needs no admin (systemd user unit + user drop-in).
     #[cfg(not(target_os = "windows"))]
     if did_something {
-        apply_dns_patch(false);
+        apply_dns_patch();
     }
 
     remove_legacy_ca();
@@ -1438,21 +1136,47 @@ fn handle_manual_path() {
     print_results(&successes, &failures);
 }
 
-fn show_admin_prewarning() {
+/// Says on the very first screen, before the licence prompt and the menu, that
+/// this run cannot install the half that answers the region 400.
+///
+/// Shown on **every** unelevated start. It used to be gated on
+/// `!is_nrpt_applied()`, which meant that on a machine unlocked once before the
+/// user was told nothing until the patch had already run - the one moment they
+/// can no longer act on it cheaply.
+///
+/// What the flag changes is the wording, not whether the screen appears: with the
+/// rules in place the relay carries the 400 from its own scheduled task and is
+/// untouched by this process's token, so "the bypass will not work" would simply
+/// be false. Saying it anyway trains the user to skip the screen.
+#[cfg(target_os = "windows")]
+fn show_admin_prewarning(dns_installed: bool) {
     clear_screen();
     println!("{}", APP_TITLE);
     println!();
-    println!("Внимание: анлокер запущен без прав администратора.");
+    println!("\x1b[33mВнимание: анлокер запущен БЕЗ прав администратора.\x1b[0m\x1b[92m");
     println!();
-    println!("Без админ-прав будут сняты только клиентские региональные");
-    println!("ограничения. Серверный патч требует повышенных привилегий");
-    println!("и будет пропущен.");
+    if dns_installed {
+        println!("Обход ошибки 400 («User location is not supported») на этой");
+        println!("машине уже установлен и продолжает работать сам по себе.");
+        println!();
+        println!("Но этот запуск не сможет его обновить, починить или");
+        println!("переустановить: DNS-служба, локальный прокси и правила NRPT");
+        println!("требуют повышенных привилегий. Доступен только патч клиента.");
+    } else {
+        println!("\x1b[33mОбход ошибки 400 («User location is not supported») в этом");
+        println!("запуске установлен НЕ БУДЕТ.\x1b[0m\x1b[92m");
+        println!();
+        println!("Без админ-прав доступен только патч клиента. DNS-служба,");
+        println!("локальный прокси и правила NRPT — то, что и снимает");
+        println!("региональную блокировку, — будут пропущены.");
+    }
     println!();
-    println!("Если вы находитесь в санкционной территории и упираетесь");
-    println!("в 'User location is not supported' — закройте окно и");
-    println!("запустите программу от имени Администратора.");
+    println!(
+        "\x1b[38;5;154mЧтобы это исправить: закройте окно, нажмите на файле анлокера правой\n\
+         кнопкой → «Запуск от имени администратора».\x1b[0m\x1b[92m"
+    );
     println!();
-    print!("Нажмите Enter чтобы продолжить... ");
+    print!("Нажмите Enter чтобы продолжить без админ-прав... ");
     io::stdout().flush().ok();
     let mut tmp = String::new();
     io::stdin().read_line(&mut tmp).ok();
@@ -1509,9 +1233,10 @@ fn main() {
 
     // The admin pre-warning is about Windows UAC and the DNS layer that needs it.
     // The Linux proxy route needs no root, so there is nothing to warn about.
+    // No `is_nrpt_applied()` gate on *whether* to warn - only on what it says.
     #[cfg(target_os = "windows")]
-    if !is_admin() && !is_nrpt_applied() {
-        show_admin_prewarning();
+    if !is_admin() {
+        show_admin_prewarning(is_nrpt_applied());
     }
 
     login_screen();
@@ -1533,23 +1258,25 @@ fn main() {
         println!("{} v{}", APP_TITLE, APP_VERSION);
         println!();
         println!("1. Разблокировать Antigravity 2.0 / IDE / CLI");
-        println!("2. Разблокировать Gemini CLI (deprecated)");
-        println!("3. Указать путь к Antigravity вручную");
+        println!("2. Указать путь к Antigravity вручную");
         println!(
-            "4. Открыть Telegram-группу ({})",
+            "3. Открыть Telegram-группу ({})",
             link(TELEGRAM_URL, TELEGRAM_URL)
-        );
-        println!(
-            "5. Отблагодарить копеечкой ({})",
-            link(DONATE_URL, DONATE_URL)
         );
         // Yellow-green (256-color 154) for the two "undo" actions; reset then
         // restore the menu's bright-green afterwards.
-        println!("\x1b[38;5;154m6. Отключить DNS-службу и NRPT (отключит исправление ошибок \"400\")\x1b[0m\x1b[92m");
-        println!("\x1b[38;5;154m7. Полный откат (снять патч и вернуть исходное состояние)\x1b[0m\x1b[92m");
-        println!("0. Выход");
+        println!("\x1b[38;5;154m4. Отключить DNS-службу и NRPT (отключит исправление ошибок \"400\")\x1b[0m\x1b[92m");
+        println!("\x1b[38;5;154m5. Полный откат (снять патч и вернуть исходное состояние)\x1b[0m\x1b[92m");
+        println!("6. Выход");
+        // Last and out of sequence on purpose (owner): the donation is the one
+        // item that asks something of the user rather than doing something for
+        // them, so it sits after the exit and takes the key nobody reaches for.
+        println!(
+            "0. Отблагодарить копеечкой ({})",
+            link(DONATE_URL, DONATE_URL)
+        );
         println!();
-        println!("Пункты 4 и 5 открывают ссылку в браузере.");
+        println!("Пункты 3 и 0 открывают ссылку в браузере.");
         // The relay is installed once and then runs from %ProgramData% across
         // reboots, so a newer unlocker sitting next to an older relay is silent
         // by default - and it is the relay that carries the DNS fixes.
@@ -1566,22 +1293,31 @@ fn main() {
             );
         }
         // Windows-only: the admin note is about the DNS layer's UAC requirement.
-        // The Linux proxy route needs no root.
+        // The Linux proxy route needs no root. Same split as the pre-warning
+        // screen - the note is always there, and only its claim depends on
+        // whether the rules are already installed.
         #[cfg(target_os = "windows")]
-        if !is_admin() && !is_nrpt_applied() {
-            println!("Запущено без админ-прав: серверный патч будет пропущен.");
+        if !is_admin() {
+            println!(
+                "\x1b[33mЗапущено без админ-прав: {} —\n\
+                 запустите от имени администратора.\x1b[0m\x1b[92m",
+                if is_nrpt_applied() {
+                    "обход региона (ошибка 400) уже стоит, но обновить его не выйдет"
+                } else {
+                    "обход региона (ошибка 400) установлен не будет"
+                }
+            );
         }
         println!();
 
         match prompt("> ").as_str() {
             "1" => handle_patch_antigravity(),
-            "2" => handle_patch_gemini(),
-            "3" => handle_manual_path(),
-            "4" => open_url(TELEGRAM_URL),
-            "5" => open_url(DONATE_URL),
-            "6" => handle_restore_dns(),
-            "7" => handle_revert_all(),
-            "0" => break,
+            "2" => handle_manual_path(),
+            "3" => open_url(TELEGRAM_URL),
+            "4" => handle_restore_dns(),
+            "5" => handle_revert_all(),
+            "6" => break,
+            "0" => open_url(DONATE_URL),
             _ => {
                 println!("{}", "Неверный выбор.");
                 thread::sleep(Duration::from_secs(1));

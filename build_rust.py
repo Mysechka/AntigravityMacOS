@@ -84,6 +84,13 @@ def record_canary(version, token, exe_path):
     return ledger
 
 
+# UPX packing is OFF (owner, `_4`). A packed exe is the single biggest source of
+# antivirus false positives here, and a user who cannot start the tool at all is a
+# worse outcome than a file three times the size. The packer below is deliberately
+# kept rather than deleted - set this back to True to ship packed again.
+UPX_ENABLED = False
+
+
 def find_upx():
     """Locate the UPX packer. Returns the executable path or None."""
     import shutil
@@ -299,7 +306,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.11.0_3"
+    VERSION = "2.11.0_4"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
@@ -602,8 +609,12 @@ if __name__ == "__main__":
         shutil.move(r"target\release\ag_unlocker.exe", out_path)
 
         # Shrink the exe in place; it stays a runnable AG_<ver>.exe.
-        print("[INFO] Сжатие исполняемого файла...")
-        compress_exe_inplace(out_path)
+        if UPX_ENABLED:
+            print("[INFO] Сжатие исполняемого файла...")
+            compress_exe_inplace(out_path)
+        else:
+            print("[INFO] UPX-сжатие отключено — отгружается несжатый .exe "
+                  "(меньше ложных срабатываний антивирусов).")
 
         print("\n[УСПЕХ] Сборка завершена!")
         print(f"Ваш исполняемый файл: {out_path}")

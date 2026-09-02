@@ -127,8 +127,8 @@ const RESP_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\r\n";
 // terminated TLS and needed a per-machine CA; the relay route replaced it and
 // needs none, so nothing here creates or signs anything. What is left finds the
 // old certificate and takes it out, because a machine that ran an earlier build
-// still has a root certificate in its user store and both undo paths (menu 6 and
-// menu 7) have to remove it. Delete these only once no installed build can still
+// still has a root certificate in its user store and both undo paths (menu 4 and
+// menu 5) have to remove it. Delete these only once no installed build can still
 // have one.
 
 /// Where an older build kept its CA. Beside the relay's log rather than beside
@@ -150,6 +150,56 @@ fn ca_key_path() -> PathBuf {
 pub fn proxy_url() -> String {
     format!("http://{}:{}", LISTEN_IP, LISTEN_PORT)
 }
+
+/// The address the listener holds, as a `SocketAddr`. Both parts are literals in
+/// this file, so it cannot fail.
+fn listen_addr() -> std::net::SocketAddr {
+    std::net::SocketAddr::from((LISTEN_IP.parse::<Ipv4Addr>().unwrap(), LISTEN_PORT))
+}
+
+/// Whether something accepts connections on the proxy's address right now.
+///
+/// This is the one precondition for `HTTPS_PROXY` naming this port. The variable
+/// is user-wide, so a value pointing at a socket nobody holds does not merely
+/// leave Antigravity unrouted - it takes every proxy-aware program on the machine
+/// with it, the language server's own OAuth call included (G31). Nothing may set
+/// that variable without asking this first.
+pub fn listener_answers() -> bool {
+    answers_at(listen_addr())
+}
+
+/// Waits up to `budget` for the listener to come up. `false` means it did not.
+///
+/// Callers exist because binding is not instant: `run` retries a port that may be
+/// held for a moment by somebody else's ephemeral socket (see `bind_listener`).
+pub fn wait_for_listener(budget: Duration) -> bool {
+    wait_at(listen_addr(), budget)
+}
+
+/// The two above, with the address given: the fixed port is what the product
+/// asks about, and a test needs one nothing else on the machine can be holding.
+///
+/// A refused connection means no listener and must read as `false`. Spelled out
+/// because the version this replaces answered `true` on its own parse failure, so
+/// a mistake there would have hidden a dead proxy rather than reported one.
+fn answers_at(addr: std::net::SocketAddr) -> bool {
+    TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
+}
+
+fn wait_at(addr: std::net::SocketAddr, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if answers_at(addr) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(POLL_FOR_LISTENER);
+    }
+}
+
+const POLL_FOR_LISTENER: Duration = Duration::from_millis(250);
 
 /// Takes the CA back out of the trust store and deletes its key.
 ///
@@ -704,10 +754,54 @@ fn serve(mut client: TcpStream, _if_index: u32) {
     tunnel(client, &host, port);
 }
 
+/// How long a taken port is given to come free, and how often it is retried.
+/// Fifteen seconds: long enough for somebody's ephemeral socket to close, short
+/// enough that a permanently reserved port is reported while the user is still
+/// looking at the menu.
+const BIND_TRIES: u32 = 6;
+const BIND_RETRY_WAIT: Duration = Duration::from_secs(3);
+
+/// Takes the fixed port, retrying while something else holds it.
+///
+/// 53129 is inside Windows' **default dynamic port range** (49152-65535), so it
+/// can be sitting in somebody's ephemeral client socket at the moment the relay
+/// starts - a race that resolves itself in seconds. It can also be inside a range
+/// Hyper-V/WSL/Docker has reserved (`netsh int ipv4 show excludedportrange`),
+/// which never resolves; the retries cost 15 s and the log line then says which
+/// of the two it was. Either way the caller must not claim the route: without a
+/// listener the `HTTPS_PROXY` naming it breaks the machine's proxy-aware traffic
+/// (G31), which is why the variable is only set once this has succeeded.
+fn bind_listener() -> Result<TcpListener, String> {
+    let mut last = String::new();
+    for attempt in 0..BIND_TRIES {
+        match TcpListener::bind(listen_addr()) {
+            Ok(listener) => {
+                if attempt > 0 {
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "порт {} освободился с {}-й попытки",
+                        LISTEN_PORT,
+                        attempt + 1
+                    ));
+                }
+                return Ok(listener);
+            }
+            Err(e) => {
+                last = e.to_string();
+                if attempt + 1 < BIND_TRIES {
+                    thread::sleep(BIND_RETRY_WAIT);
+                }
+            }
+        }
+    }
+    Err(format!(
+        "не занять {}:{} — {}",
+        LISTEN_IP, LISTEN_PORT, last
+    ))
+}
+
 /// Runs the proxy until the process ends. Never returns while the socket holds.
 pub fn run(if_index: u32) -> Result<(), String> {
-    let listener = TcpListener::bind((LISTEN_IP.parse::<Ipv4Addr>().unwrap(), LISTEN_PORT))
-        .map_err(|e| format!("не занять {}:{} — {}", LISTEN_IP, LISTEN_PORT, e))?;
+    let listener = bind_listener()?;
     // Costs a loopback socket and nothing else: no key is generated, nothing is
     // put in a trust store, and a client that never points at this port never
     // notices it is here.
@@ -722,6 +816,47 @@ pub fn run(if_index: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The listener check must answer about the socket, and a refused connection
+    /// must read as "no listener".
+    ///
+    /// This is the gate in front of `HTTPS_PROXY` (G31, I53). The helper it
+    /// replaces returned `true` when it could not parse its own URL, i.e. it
+    /// reported a dead proxy as a live one - the exact direction of error that
+    /// leaves a user-wide variable pointing at nothing.
+    #[test]
+    fn a_socket_nobody_holds_reads_as_no_listener() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+        let addr = listener.local_addr().expect("addr");
+
+        assert!(answers_at(addr), "a bound port must answer");
+        assert!(
+            wait_at(addr, Duration::from_secs(1)),
+            "waiting on a bound port must return at once"
+        );
+
+        drop(listener);
+        assert!(!answers_at(addr), "a closed port must not answer");
+    }
+
+    /// And it must keep looking for the whole budget rather than deciding on one
+    /// probe: the port can be held for a few seconds by somebody's ephemeral
+    /// socket while `bind_listener` retries it.
+    #[test]
+    fn waiting_for_a_listener_that_never_comes_costs_the_budget_and_says_no() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+
+        let budget = Duration::from_millis(600);
+        let started = Instant::now();
+        assert!(!wait_at(addr, budget));
+        assert!(
+            started.elapsed() >= budget,
+            "gave up after {:?}, before the budget was spent",
+            started.elapsed()
+        );
+    }
 
     /// A status line that lost its carriage returns is still valid Rust and
     /// still compiles - it just produces a response no HTTP client accepts.

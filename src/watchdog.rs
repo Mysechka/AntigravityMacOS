@@ -124,7 +124,7 @@ struct ListenerGuard {
 
 impl ListenerGuard {
     fn check(&mut self) {
-        if listener_answers() {
+        if crate::proxy::listener_answers() {
             self.misses = 0;
             return;
         }
@@ -151,18 +151,6 @@ impl ListenerGuard {
             Err(e) => log(&format!("не удалось снять HTTPS_PROXY: {}", e)),
         }
     }
-}
-
-/// Whether something accepts connections on the proxy's address right now.
-fn listener_answers() -> bool {
-    let addr: std::net::SocketAddr = match crate::proxy::proxy_url()
-        .trim_start_matches("http://")
-        .parse()
-    {
-        Ok(a) => a,
-        Err(_) => return true,
-    };
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
 }
 
 /// One file, one poll.

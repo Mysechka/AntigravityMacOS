@@ -264,7 +264,10 @@ mod tests {
             append(&path, NOISE);
         }
         let (off, _) = scan(&path, None);
-        assert!(off > REFUSAL.len() as u64, "the rewrite below must shrink it");
+        assert!(
+            off > REFUSAL.len() as u64,
+            "the rewrite below must shrink it"
+        );
         // The app restarted and truncated its log; the new content is news.
         fs::write(&path, REFUSAL).expect("truncate");
         let (off2, hits) = scan(&path, Some(off));

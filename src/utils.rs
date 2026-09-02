@@ -155,18 +155,6 @@ pub fn prompt(label: &str) -> String {
     input.trim().to_string()
 }
 
-/// Hint shown next to any printed link, telling the user how to follow it.
-pub fn open_hint(keyword: &str) -> String {
-    if supports_hyperlinks() {
-        format!(
-            "(Ctrl+клик по ссылке, либо введите '{}' чтобы открыть в браузере)",
-            keyword
-        )
-    } else {
-        format!("(введите '{}' чтобы открыть в браузере)", keyword)
-    }
-}
-
 #[cfg(target_os = "windows")]
 pub fn mask_path(path: &str) -> String {
     let mut result = path.to_string();

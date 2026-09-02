@@ -533,6 +533,10 @@ static LAST_PENALTY: Mutex<Option<Instant>> = Mutex::new(None);
 /// gone before a refusal can be attributed again.
 const PENALTY_EPISODE: Duration = Duration::from_secs(3 * 60);
 
+/// How long the proxy listener is given to appear before the route is treated as
+/// absent. Covers `proxy::bind_listener`'s own retries (15 s) with room to spare.
+const PROXY_START_BUDGET: Duration = Duration::from_secs(30);
+
 /// Runs until killed. Never returns `Ok` - the only way out is a bind failure,
 /// which is worth reporting because it means something else holds the address.
 pub fn run() -> Result<(), String> {
@@ -548,19 +552,30 @@ pub fn run() -> Result<(), String> {
     thread::spawn(warm_forever);
     // The proxy variable is user-wide and must never outlive the listener it
     // names, so the watchdog takes it off when the listener is dead for a while
-    // (G20). This is the other half: the listener is coming up, so the route is
-    // back. Off the startup path - it is a PowerShell call - and never in front
-    // of a proxy the user set themselves.
+    // (G20). This is the other half: the listener is up, so the route is back.
+    // Off the startup path - it is a PowerShell call - and never in front of a
+    // proxy the user set themselves.
+    //
+    // "Is up", not "is coming up": this used to run the moment the relay started,
+    // which is a promise about a socket that had not been bound yet. When the bind
+    // then failed - the port is inside Windows' dynamic range, so it can be taken
+    // (G31) - the variable was restored anyway and the watchdog took it back off
+    // ninety seconds later, every logon, and everything proxy-aware on the machine
+    // spent that window with no network.
     #[cfg(target_os = "windows")]
-    thread::spawn(
-        || match crate::endpoint::ensure_proxy_env(&proxy::proxy_url()) {
+    thread::spawn(|| {
+        if !proxy::wait_for_listener(PROXY_START_BUDGET) {
+            log_proxy("HTTPS_PROXY не выставлена: локальный прокси не поднялся");
+            return;
+        }
+        match crate::endpoint::ensure_proxy_env(&proxy::proxy_url()) {
             Ok(crate::endpoint::Outcome::Applied) => {
                 log_proxy("HTTPS_PROXY снова указывает на локальный прокси")
             }
             Ok(crate::endpoint::Outcome::AlreadySet) => {}
             Err(e) => log_proxy(&format!("HTTPS_PROXY не восстановлена: {}", e)),
-        },
-    );
+        }
+    });
 
     // The fallback route lives in this process because it needs the same two
     // things the relay already has: the ISP interface, and the resolver pool

@@ -296,23 +296,6 @@ fn kill_platform_processes() {
             .output()
             .ok();
     }
-
-    // Gemini CLI runs on node. Only the node processes that actually host it
-    // are stopped - killing every node.exe would take down unrelated dev
-    // servers and editors.
-    Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" -ErrorAction SilentlyContinue | \
-             Where-Object { $_.CommandLine -like '*gemini-cli*' } | \
-             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok();
 }
 
 /// The Linux/macOS side. The language server is the process holding the file
@@ -333,14 +316,6 @@ fn kill_platform_processes() {
             .status()
             .ok();
     }
-    // Gemini CLI hosted on node, matched by its module path only so unrelated
-    // node processes are left alone.
-    Command::new("pkill")
-        .args(["-f", "gemini-cli"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok();
 }
 
 /// Outcome of patching the native binaries of one install.

@@ -54,7 +54,7 @@ mod windows_impl {
     const TASK_NAME: &str = "AG Unlocker DNS";
     /// The watchdog's own logon task, separate from the relay's. Decoupling the
     /// re-patch survival from the relay is what lets it keep working when the relay
-    /// is stopped (menu 6), has died, or was never installed (a future patch-only
+    /// is stopped (menu 4), has died, or was never installed (a future patch-only
     /// machine) - the case G9 describes today, where no relay means no watchdog.
     const WATCHDOG_TASK_NAME: &str = "AG Unlocker Watchdog";
     const EXE_NAME: &str = "ag_dns.exe";
