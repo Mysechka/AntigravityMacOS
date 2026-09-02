@@ -319,6 +319,152 @@ pub fn remove_proxy(_url: &str, _ca_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A proxy the user set up themselves, which this tool must not get in front of.
+///
+/// Two places one can live. `HTTPS_PROXY` in the User or Machine environment is
+/// what the language server (Go, `net/http`) actually reads; `http.proxy` in
+/// Antigravity's own `settings.json` is what the Node side reads, and whether
+/// the language server inherits it is **unverified** - so it is respected as a
+/// statement of intent either way. A value naming our own listener is not
+/// foreign; anything else is, and the answer says where it was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignProxy {
+    pub value: String,
+    pub found_in: String,
+}
+
+/// The user's own proxy, if they configured one anywhere the client would read.
+#[cfg(target_os = "windows")]
+pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
+    for scope in ["User", "Machine"] {
+        if let Some(value) = current_env_in(PROXY_ENV_VAR, scope) {
+            if !is_our_proxy_value(&value, ours) {
+                return Some(ForeignProxy {
+                    value,
+                    found_in: format!("переменная среды {} ({})", PROXY_ENV_VAR, scope),
+                });
+            }
+        }
+    }
+    antigravity_proxy_setting(ours)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
+    antigravity_proxy_setting(ours)
+}
+
+/// `http.proxy` from the `settings.json` of every Antigravity product under the
+/// user's profile. Product folders are matched by prefix, so a rebranded build
+/// and the Desktop app - which ships no loose `product.json` for
+/// `ide_settings_path` to read - are both covered.
+fn antigravity_proxy_setting(ours: &str) -> Option<ForeignProxy> {
+    let root = profile_root()?;
+    let entries = fs::read_dir(&root).ok()?;
+    for entry in entries.flatten().take(64) {
+        let name = entry.file_name();
+        if !name
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("antigravity")
+        {
+            continue;
+        }
+        let path = entry.path().join("User").join("settings.json");
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(value) = proxy_setting_in(&text) {
+            if !is_our_proxy_value(&value, ours) {
+                return Some(ForeignProxy {
+                    value,
+                    found_in: format!(
+                        "http.proxy в {}",
+                        crate::utils::mask_path(&path.to_string_lossy())
+                    ),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The `http.proxy` value in a settings file, if it is set to something.
+///
+/// Textual, like every other look at this file (I18), and line-wise so a
+/// commented-out setting - JSONC allows them, and a user trying things out leaves
+/// them - is not read as a live one. A URL contains `//` too, which is why the
+/// test is "the line starts with a comment", not "the line contains one".
+fn proxy_setting_in(text: &str) -> Option<String> {
+    let re = Regex::new(r#""http\.proxy"\s*:\s*"([^"]*)""#).ok()?;
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .find_map(|l| {
+            re.captures(l)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().trim().to_string())
+        })
+        .filter(|v| !v.is_empty())
+}
+
+#[cfg(target_os = "windows")]
+fn profile_root() -> Option<PathBuf> {
+    std::env::var("APPDATA").ok().map(PathBuf::from)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn profile_root() -> Option<PathBuf> {
+    match std::env::var("XDG_CONFIG_HOME") {
+        Ok(x) if !x.is_empty() => Some(PathBuf::from(x)),
+        _ => std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".config")),
+    }
+}
+
+/// Puts `HTTPS_PROXY` back on our listener when it has gone missing and nothing
+/// of the user's has taken its place. The relay calls this at start: the
+/// watchdog takes the variable off when the listener is dead for a while (so a
+/// dead relay cannot take the machine's network with it, G20), and this is the
+/// other half - the listener is back, so the route is too. A variable already
+/// pointing here, or a proxy the user set themselves, is left exactly as it is.
+#[cfg(target_os = "windows")]
+pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
+    if current_env(PROXY_ENV_VAR).is_some_and(|v| is_our_proxy_value(&v, ours)) {
+        return Ok(Outcome::AlreadySet);
+    }
+    if foreign_proxy(ours).is_some() {
+        return Ok(Outcome::AlreadySet);
+    }
+    apply_proxy(ours, "")
+}
+
+/// Takes `HTTPS_PROXY` off only when it names our listener. `Ok(true)` when it
+/// did and was removed, `Ok(false)` when there was nothing of ours to remove.
+/// The watchdog's primitive: it must never touch a value the user set.
+#[cfg(target_os = "windows")]
+pub fn remove_proxy_if_ours(url: &str, ca_path: &str) -> Result<bool, String> {
+    if !current_env(PROXY_ENV_VAR).is_some_and(|v| is_our_proxy_value(&v, url)) {
+        return Ok(false);
+    }
+    remove_proxy(url, ca_path).map(|()| true)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn remove_proxy_if_ours(_url: &str, _ca_path: &str) -> Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(target_os = "windows")]
+fn current_env_in(name: &str, scope: &str) -> Option<String> {
+    let out = powershell(&format!(
+        "[Environment]::GetEnvironmentVariable('{}','{}')",
+        name, scope
+    ))?;
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 /// Whether an `HTTPS_PROXY` value is one this tool wrote.
 ///
 /// Compared on the **address**, not on the exact string. A value that has been
@@ -430,6 +576,41 @@ fn current_cli_endpoint() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The user's own `http.proxy` is read as intent: set means set, empty or
+    /// commented out means nothing, and a URL's own `//` is not a comment.
+    #[test]
+    fn a_proxy_setting_is_found_only_when_it_is_live_and_non_empty() {
+        assert_eq!(
+            proxy_setting_in(r#"{ "http.proxy": "http://10.0.0.1:3128", "x": 1 }"#).as_deref(),
+            Some("http://10.0.0.1:3128")
+        );
+        assert_eq!(
+            proxy_setting_in("{\n    \"http.proxy\" : \"socks5://h:1080\"\n}").as_deref(),
+            Some("socks5://h:1080")
+        );
+        assert_eq!(proxy_setting_in(r#"{ "http.proxy": "" }"#), None);
+        assert_eq!(
+            proxy_setting_in(r#"{ "http.proxyStrictSSL": "yes" }"#),
+            None
+        );
+        assert_eq!(
+            proxy_setting_in("{\n    // \"http.proxy\": \"http://old:3128\",\n    \"a\": 1\n}"),
+            None,
+            "a commented-out setting is not a setting"
+        );
+        assert_eq!(proxy_setting_in("{}"), None);
+    }
+
+    /// Our own listener in the settings file is not a foreign proxy.
+    #[test]
+    fn our_own_listener_in_settings_is_not_foreign() {
+        let ours = "http://127.0.0.1:53129";
+        let value = proxy_setting_in(r#"{ "http.proxy": "http://127.0.0.1:53129/" }"#).unwrap();
+        assert!(is_our_proxy_value(&value, ours));
+        let value = proxy_setting_in(r#"{ "http.proxy": "http://127.0.0.1:8080" }"#).unwrap();
+        assert!(!is_our_proxy_value(&value, ours));
+    }
 
     /// The bug users hit: a revert that left `HTTPS_PROXY` naming a port it had
     /// just deleted, so nothing on the machine could reach the network. Part of

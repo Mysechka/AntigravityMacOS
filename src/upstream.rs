@@ -69,14 +69,19 @@ pub struct Route {
     /// How this route is named in the log - never its address. A built-in exit is
     /// private, and a log file is the one thing users paste into public chats.
     label: &'static str,
+    /// Which row of the route table a probe of this route feeds. The user's own
+    /// proxy has a row of its own; every built-in exit feeds the one `Exits` row,
+    /// because the proxy treats the pool as a single route.
+    kind: crate::routes::Kind,
 }
 
 impl Route {
-    pub const fn new(label: &'static str) -> Self {
+    pub const fn new(label: &'static str, kind: crate::routes::Kind) -> Self {
         Route {
             health: Health::new(label),
             bad_exit: Mutex::new(None),
             label,
+            kind,
         }
     }
 
@@ -165,10 +170,23 @@ impl Route {
             }
         }
 
+        // Timed as a whole - reaching the proxy, its CONNECT, the TLS to Google
+        // inside it and the answer - because that is what a request through it
+        // costs, and the route table ranks routes by exactly that (routes.rs).
+        let started = Instant::now();
         match probe(up) {
-            Ok(()) => self.health.revive("проверка прошла"),
+            Ok(()) => {
+                crate::routes::record(self.kind, started.elapsed());
+                self.health.revive("проверка прошла");
+            }
             Err(why) => {
                 crate::dns_forwarder::log_proxy(&format!("{} не отвечает: {}", self.label, why));
+                // One built-in exit failing says nothing about the pool's speed -
+                // its own bench takes it out of rotation; the row stays as the
+                // other exits measured it.
+                if self.kind != crate::routes::Kind::Exits {
+                    crate::routes::record_failure(self.kind);
+                }
                 self.health.probe_failed();
             }
         }
@@ -176,7 +194,7 @@ impl Route {
 }
 
 /// The user's own proxy, as a route. Built-in exits carry one of these each.
-pub static OWN: Route = Route::new("свой прокси");
+pub static OWN: Route = Route::new("свой прокси", crate::routes::Kind::Own);
 
 /// A user-supplied HTTP CONNECT proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -698,7 +716,7 @@ mod tests {
     /// one per route: two of these could now run in parallel without fighting.
     #[test]
     fn a_blocked_exit_stands_the_route_down_until_the_address_changes() {
-        let r = Route::new("тест");
+        let r = Route::new("тест", crate::routes::Kind::Own);
 
         r.note_blocked_exit("203.0.113.7", "RU");
         assert_eq!(r.bad_exit().as_deref(), Some("203.0.113.7"));
@@ -726,8 +744,8 @@ mod tests {
     /// dead built-in exit would have benched the user's own proxy too.
     #[test]
     fn routes_stand_down_independently() {
-        let a = Route::new("тест A");
-        let b = Route::new("тест B");
+        let a = Route::new("тест A", crate::routes::Kind::Own);
+        let b = Route::new("тест B", crate::routes::Kind::Own);
         a.note_blocked_exit("203.0.113.7", "RU");
         a.health.note(false);
         a.health.note(false);

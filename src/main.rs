@@ -30,11 +30,13 @@ mod egress;
 mod endpoint;
 mod health;
 mod hosts_pin;
+mod ls_log;
 mod patch_binary;
 mod patch_gemini;
 mod patch_ide;
 mod proxy;
 mod resolvers;
+mod routes;
 mod upstream;
 mod utils;
 mod watchdog;
@@ -1073,36 +1075,48 @@ fn advise_on_exit() {
     }
 }
 
-/// Points `HTTPS_PROXY` at our local gate proxy only when the user has their own
-/// exit configured; otherwise takes it back off so gate hosts resolve straight to
-/// their substituted address and connect DIRECT.
+/// Points `HTTPS_PROXY` at our local gate proxy - unless the user has a proxy of
+/// their own, in which case theirs is left alone and ours is taken off.
 ///
-/// This is the demotion of the always-on relay carrier (see the note in
-/// `handle_patch_antigravity`). Two jobs:
-/// - **Own exit present** -> set the variable, so our local proxy carries the
-///   gate hosts through the user's proxy (its ladder: own -> built-in exit ->
-///   relay -> direct tunnel). Routing through their proxy is what they asked for,
-///   so the user-wide reach is acceptable here - and our local proxy still
-///   tunnels every non-gate host directly, so only gated calls pay the hop.
-/// - **No own exit** (the default, and every upgrade from <= 2.11.0_1) -> remove
-///   the variable. A machine patched by an older build still carries
-///   `HTTPS_PROXY=127.0.0.1:53129` from the old always-on route; leaving it would
-///   keep that machine on the slow carrier. Taking it off restores the fast
-///   direct path. Trigger is `configured()`, not `available()`: `available()`
-///   also asks `OWN.usable()`, which only the relay's warm loop sets, and it is
-///   not running at menu time.
+/// Always on, and the reason is availability, not speed. With the variable off
+/// the language server reaches a gate host only by the address the DNS layer
+/// substitutes; the day every provider drops a name (S9 happened) nothing on the
+/// machine can route around it, because the routes that could - a built-in exit,
+/// the relay, the user's own proxy - are only reachable through the local proxy.
+/// With it on, the proxy picks the route per connection from a table it measures
+/// (routes.rs), and the *default* row for a gate host is a direct tunnel to that
+/// same substituted address - so the fast path S32 measured (0.28 s) is kept,
+/// and the hop through loopback is the only cost. Non-gate hosts are a raw
+/// tunnel either way.
+///
+/// The user's own proxy comes first: a `HTTPS_PROXY` of theirs, or `http.proxy`
+/// in Antigravity's settings, means every request already goes where they want
+/// it, and this tool gets out of the way. Whether the language server honours
+/// the settings.json value is unverified, so it is treated as intent regardless.
 fn reconcile_gate_proxy() {
     let url = proxy::proxy_url();
-    if upstream::configured().is_some() {
-        match endpoint::apply_proxy(&url, "") {
-            Ok(endpoint::Outcome::AlreadySet) => {}
-            Ok(_) => println!("Свой прокси включён для трафика Antigravity."),
-            Err(e) => println!("\x1b[33m{}\x1b[0m\x1b[92m", e),
-        }
-    } else {
-        // Same removal the undo paths use, scoped to our own value (G20/I45).
+    if let Some(theirs) = endpoint::foreign_proxy(&url) {
+        println!(
+            "У вас настроен свой прокси ({}): {}.",
+            theirs.found_in, theirs.value
+        );
+        println!("  Трафик Antigravity идёт через него, анлокер его не перехватывает.");
+        // Ours must not sit above theirs (User scope beats Machine scope).
         let ca = proxy::ca_cert_path().to_string_lossy().to_string();
         endpoint::remove_proxy(&url, &ca).ok();
+        return;
+    }
+    match endpoint::apply_proxy(&url, "") {
+        Ok(endpoint::Outcome::AlreadySet) => {}
+        Ok(_) => {
+            println!("Локальный прокси для гейт-хостов включён ({}).", url);
+            println!(
+                "  \x1b[38;5;154mМаршрут выбирается по замеру: напрямую по подменённому адресу,\n  \
+                 а при сбое — через запасные пути. Если Antigravity был запущен до\n  \
+                 этого шага, перезапустите его, чтобы он увидел переменную.\x1b[0m\x1b[92m"
+            );
+        }
+        Err(e) => println!("\x1b[33m{}\x1b[0m\x1b[92m", e),
     }
 }
 

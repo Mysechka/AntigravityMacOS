@@ -72,10 +72,17 @@ fn run() {
     let mut states: HashMap<PathBuf, FileState> = HashMap::new();
     let mut installs = discover();
     let mut cycles: u32 = 0;
+    let mut listener = ListenerGuard::default();
 
     loop {
         if cycles % REDISCOVER_EVERY == 0 {
             installs = discover();
+        }
+        // Not on the first poll: at logon this task and the relay's start
+        // together, and a miss before the relay has bound would start the count
+        // early - the log says ninety seconds and it should mean it.
+        if cycles > 0 && cycles % LISTENER_CHECK_EVERY == 0 {
+            listener.check();
         }
         cycles = cycles.wrapping_add(1);
 
@@ -87,6 +94,75 @@ fn run() {
 
         thread::sleep(POLL);
     }
+}
+
+/// How often the proxy listener is looked at, in polls. 15 x 2 s = 30 s.
+const LISTENER_CHECK_EVERY: u32 = 15;
+/// Consecutive misses before the variable comes off: 3 x 30 s. A relay
+/// restarting under its task (3 tries a minute apart) is back well inside that;
+/// one that is not coming back has by then cost every proxy-aware program on
+/// the machine ninety seconds, which is enough.
+const LISTENER_DEAD_AFTER: u32 = 3;
+/// Once the variable was found absent or removed, how long before the (slow,
+/// PowerShell-backed) environment read is worth repeating.
+const ENV_RECHECK: Duration = Duration::from_secs(10 * 60);
+
+/// Keeps `HTTPS_PROXY` from outliving the listener it names.
+///
+/// The variable is user-wide, so everything that honours it - not only
+/// Antigravity - goes through `127.0.0.1:53129`. A relay that has died and is not
+/// coming back would then take the machine's network with it (G20, seen once
+/// after a revert). This is the runtime half of that fix: no listener for a
+/// while and the variable is ours, off it comes; the relay puts it back when it
+/// starts again (`endpoint::ensure_proxy_env`). A value that is not ours is never
+/// touched.
+#[derive(Default)]
+struct ListenerGuard {
+    misses: u32,
+    env_checked_at: Option<std::time::Instant>,
+}
+
+impl ListenerGuard {
+    fn check(&mut self) {
+        if listener_answers() {
+            self.misses = 0;
+            return;
+        }
+        self.misses = self.misses.saturating_add(1);
+        if self.misses < LISTENER_DEAD_AFTER {
+            return;
+        }
+        if self
+            .env_checked_at
+            .is_some_and(|at| at.elapsed() < ENV_RECHECK)
+        {
+            return;
+        }
+        self.env_checked_at = Some(std::time::Instant::now());
+        let url = crate::proxy::proxy_url();
+        let ca = crate::proxy::ca_cert_path().to_string_lossy().to_string();
+        match crate::endpoint::remove_proxy_if_ours(&url, &ca) {
+            Ok(true) => log(&format!(
+                "прокси {} не отвечает {} с — HTTPS_PROXY снята, чтобы не ронять сеть",
+                url,
+                LISTENER_DEAD_AFTER * LISTENER_CHECK_EVERY * POLL.as_secs() as u32
+            )),
+            Ok(false) => {}
+            Err(e) => log(&format!("не удалось снять HTTPS_PROXY: {}", e)),
+        }
+    }
+}
+
+/// Whether something accepts connections on the proxy's address right now.
+fn listener_answers() -> bool {
+    let addr: std::net::SocketAddr = match crate::proxy::proxy_url()
+        .trim_start_matches("http://")
+        .parse()
+    {
+        Ok(a) => a,
+        Err(_) => return true,
+    };
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
 }
 
 /// One file, one poll.

@@ -9,8 +9,10 @@ use std::time::{Duration, Instant};
 use crate::dns;
 use crate::dns_client;
 use crate::egress;
+use crate::ls_log;
 use crate::proxy;
 use crate::resolvers::{self, Verdict};
+use crate::routes;
 use crate::upstream;
 
 // A loopback DNS relay, so the answers stay fresh.
@@ -81,7 +83,11 @@ pub const LISTEN_PORT: u16 = 53;
 ///     request, and a burst of in-flight failures no longer lengthens the bench.
 /// 23 = every child process it shells out to is bounded, so a hung helper can no
 ///     longer stop it dead.
-pub const RELAY_VERSION: u32 = 26;
+/// 27 = routes are ordered by measured speed (`routes`), the client's own log is
+///     tailed for the region 400 (`ls_log`) and answered by forcing substitution
+///     back on and penalising the route it came through, and the direct route
+///     fails inside a budget instead of hanging on the OS connect timeout.
+pub const RELAY_VERSION: u32 = 27;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -344,6 +350,7 @@ fn warm_forever() {
     let mut since_probe = PROBE_HEALTHY_EVERY;
     let mut since_upstream = PROBE_HEALTHY_EVERY;
     let mut since_exits = PROBE_HEALTHY_EVERY;
+    let mut since_direct = PROBE_HEALTHY_EVERY;
     let mut since_vpn = VPN_CHECK_EVERY;
     loop {
         // First, because everything below depends on it: when a tunnel carries
@@ -363,7 +370,11 @@ fn warm_forever() {
             // sees its sockets on the ISP link and starts substituting again.
             let eg = egress::detect();
             let (stand_down, client) = egress::vpn_verdict(eg.as_ref());
-            if stand_down != resolvers::vpn_is_active() {
+            // Compared against the raw verdict, not `vpn_is_active()`: while
+            // substitution is forced on (region 400 through the tunnel) the
+            // latter reads false whatever the tunnel does, and the line below
+            // would repeat every pass.
+            if stand_down != resolvers::tunnel_carries_client() {
                 log(
                     &match (stand_down, eg.is_some_and(|e| e.vpn_active), client) {
                         (true, _, _) => {
@@ -385,6 +396,17 @@ fn warm_forever() {
             since_vpn = Duration::ZERO;
         }
         let egress = isp_interface();
+        // The client's own log is the one place the region 400 is written down
+        // (ls_log). Every pass, because a refusal costs the user every request
+        // until it is answered, and reading a file's tail costs nothing. Before
+        // the warm, not after: answering a refusal expires the cached answers
+        // for the gate names, and the warm below is what refills them - in the
+        // other order the cache sat empty for a whole pass and a client query
+        // in that window paid for a cold race (I23).
+        let refusals = ls_log::poll();
+        if !refusals.is_empty() {
+            answer_region_400(&refusals);
+        }
         resolvers::warm(dns::core_namespaces(), egress);
         // Checked on our own time rather than with someone's request. While the
         // route is benched this runs every pass, because the cost being paid then
@@ -415,13 +437,101 @@ fn warm_forever() {
             proxy::probe_exits();
             since_exits = Duration::ZERO;
         }
+        // The direct route is timed on the same clock as the others, so the
+        // route table compares like with like. Not more often while penalised:
+        // a region penalty is a clock, and no measurement shortens it.
+        if since_direct >= PROBE_HEALTHY_EVERY {
+            proxy::probe_direct(egress);
+            since_direct = Duration::ZERO;
+        }
+        routes::refresh_leader(|k| proxy::route_usable(k, ROUTE_PROBE_HOST));
         thread::sleep(WARM_EVERY);
         since_probe += WARM_EVERY;
         since_upstream += WARM_EVERY;
         since_exits += WARM_EVERY;
+        since_direct += WARM_EVERY;
         since_vpn += WARM_EVERY;
     }
 }
+
+/// The name the route table is refreshed against: the gate host the IDE uses.
+const ROUTE_PROBE_HOST: &str = "daily-cloudcode-pa.googleapis.com";
+
+/// A region 400 is attributed to the route that opened a gate tunnel within
+/// this long before it was seen. Longer than the client's pool idle (90 s), so
+/// a refusal on a pooled connection still finds the route it rode on.
+const ATTRIBUTION_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Does what a region 400 in the client's log calls for.
+///
+/// Three things, each aimed at a different way the gate can have been met:
+/// - the relay was standing down for a tunnel the client is in, and the tunnel
+///   exits somewhere blocked -> substitution is forced back on for a while, so
+///   the client is sent to a provider's proxy through the tunnel (D13 revised
+///   once more: the tunnel decides *until it is measured wrong*);
+/// - the relay was substituting, so the address it handed out led to the gate
+///   anyway -> every remembered choice and answer for the gate names is
+///   dropped, and the next warm pass races the providers from scratch;
+/// - a proxy route carried the refusal -> that route goes to the back of the
+///   route table for a while, so the client's retry takes another one.
+///
+/// Anything in flight stays in flight: nothing here touches an open tunnel, and
+/// the client's next connection is what takes the new route.
+fn answer_region_400(refusals: &[(std::path::PathBuf, usize)]) {
+    let total: usize = refusals.iter().map(|(_, n)| n).sum();
+    for (path, n) in refusals {
+        log_proxy(&format!(
+            "region-400 x{} в {} — Antigravity упёрся в гейт",
+            n,
+            path.file_name()
+                .map_or_else(String::new, |f| f.to_string_lossy().into_owned())
+        ));
+    }
+    if resolvers::vpn_is_active() {
+        resolvers::force_substitution(resolvers::FORCE_SUBSTITUTE_FOR);
+        log(&format!(
+            "VPN-выход не снимает гейт — подмена включена принудительно на {} мин",
+            resolvers::FORCE_SUBSTITUTE_FOR.as_secs() / 60
+        ));
+    } else {
+        resolvers::forget_names(dns::core_namespaces());
+        log("кэш выбора провайдера сброшен — гейт-имена опрашиваются заново");
+    }
+    // One penalty per episode. The refusal is attributed to the route that most
+    // recently opened a gate tunnel, and that is only right for the *first*
+    // refusal: the client keeps retrying on the pooled connection it already
+    // has - which stays on the penalised route (I35) - while its next tunnel
+    // opens on whichever route now comes first. Read naively, every retry would
+    // then penalise the route that replaced the bad one, and within a minute
+    // all of them were benched by the mechanism meant to switch between them.
+    if let Some((kind, ago)) = routes::last_used() {
+        let in_episode = LAST_PENALTY
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .is_some_and(|at| at.elapsed() < PENALTY_EPISODE);
+        if ago < ATTRIBUTION_WINDOW && !routes::is_penalised(kind) && !in_episode {
+            routes::penalise(kind);
+            if let Ok(mut g) = LAST_PENALTY.lock() {
+                *g = Some(Instant::now());
+            }
+            log_proxy(&format!(
+                "маршрут «{}» нёс region-400 ({} шт.) — отложен на {} мин",
+                kind.label(),
+                total,
+                routes::REGION_PENALTY.as_secs() / 60
+            ));
+        }
+    }
+}
+
+/// When a route was last penalised for a refusal. While the episode lasts,
+/// further refusals penalise nobody: they are the client's retries on the
+/// connection it still holds to the route already benched.
+static LAST_PENALTY: Mutex<Option<Instant>> = Mutex::new(None);
+/// Longer than the client's pool idle (Go's 90 s), so the old connection is
+/// gone before a refusal can be attributed again.
+const PENALTY_EPISODE: Duration = Duration::from_secs(3 * 60);
 
 /// Runs until killed. Never returns `Ok` - the only way out is a bind failure,
 /// which is worth reporting because it means something else holds the address.
@@ -436,6 +546,21 @@ pub fn run() -> Result<(), String> {
     log(&format!("egress: if{}", isp_interface()));
     record_version();
     thread::spawn(warm_forever);
+    // The proxy variable is user-wide and must never outlive the listener it
+    // names, so the watchdog takes it off when the listener is dead for a while
+    // (G20). This is the other half: the listener is coming up, so the route is
+    // back. Off the startup path - it is a PowerShell call - and never in front
+    // of a proxy the user set themselves.
+    #[cfg(target_os = "windows")]
+    thread::spawn(
+        || match crate::endpoint::ensure_proxy_env(&proxy::proxy_url()) {
+            Ok(crate::endpoint::Outcome::Applied) => {
+                log_proxy("HTTPS_PROXY снова указывает на локальный прокси")
+            }
+            Ok(crate::endpoint::Outcome::AlreadySet) => {}
+            Err(e) => log_proxy(&format!("HTTPS_PROXY не восстановлена: {}", e)),
+        },
+    );
 
     // The fallback route lives in this process because it needs the same two
     // things the relay already has: the ISP interface, and the resolver pool

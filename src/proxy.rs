@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use rustls::{ClientConfig, ClientConnection};
 
+use crate::routes;
 use crate::upstream;
 use crate::utils::no_window;
 
@@ -233,9 +234,194 @@ fn try_own_proxy(mut client: TcpStream, host: &str, port: u16) -> Result<(), Tcp
     if client.write_all(RESP_ESTABLISHED).is_err() {
         return Ok(());
     }
+    routes::note_used(routes::Kind::Own);
     crate::dns_forwarder::log_proxy(&format!("свой прокси -> {}", host));
     splice(client, upstream_sock);
     Ok(())
+}
+
+/// Longest the direct route may spend connecting to a gate host before the next
+/// route deserves the client. Spread across every address the name resolves to,
+/// so a black-holing first address does not spend it all (G7).
+const DIRECT_OPEN_BUDGET: Duration = Duration::from_secs(4);
+/// The same for a host that has no other route: long enough for a slow edge,
+/// short enough that an abandoned socket does not hold a thread for Windows'
+/// own 21 s per address.
+const TUNNEL_OPEN_BUDGET: Duration = Duration::from_secs(10);
+
+/// The direct route for a gate host: a plain tunnel to whatever the system
+/// resolver - i.e. the NRPT rule, i.e. our own relay - says the name is.
+///
+/// A route like the others, not the floor under them: it fails *before* the
+/// `200` when nothing answers inside its budget, and hands the client back for
+/// the next route (I35). The old shape connected with the OS default timeout
+/// and answered 502, which cost a client 21 s per dead address and then nothing.
+fn try_direct(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
+    let upstream = match connect_bounded(host, port, DIRECT_OPEN_BUDGET) {
+        Ok(sock) => sock,
+        Err(why) => {
+            crate::dns_forwarder::log_proxy(&format!("напрямую {}: {}", host, why));
+            return Err(client);
+        }
+    };
+    if client.write_all(RESP_ESTABLISHED).is_err() {
+        return Ok(());
+    }
+    routes::note_used(routes::Kind::Direct);
+    splice(client, upstream);
+    Ok(())
+}
+
+/// Connects to `host:port` inside `budget`, walking every address the name
+/// resolves to and giving each a slice rather than the remainder.
+fn connect_bounded(host: &str, port: u16, budget: Duration) -> Result<TcpStream, String> {
+    let deadline = Instant::now() + budget;
+    let mut addrs: Vec<_> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("имя не разрешается: {}", e))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("имя не разрешается".to_string());
+    }
+    // IPv4 first. Every substituted address is IPv4 - the providers' proxies
+    // are - while an AAAA answer for the same name is genuine Google, and on a
+    // machine with global IPv6 the resolver may list it first. Connecting there
+    // would reach the gate from the blocked region with the DNS layer "working".
+    addrs.sort_by_key(|a| a.is_ipv6());
+    // A slice per address, at least a second each, so three addresses get a
+    // real attempt inside a four-second budget.
+    let slice = (budget / addrs.len().max(1) as u32).max(Duration::from_secs(1));
+    let mut last = "время вышло".to_string();
+    for addr in addrs {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&addr, slice.min(left)) {
+            Ok(sock) => return Ok(sock),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(format!("не подключиться: {}", last))
+}
+
+/// Whether `kind` is worth offering the next gate connection to. The route
+/// table orders; this says who is in the running at all.
+pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
+    match kind {
+        routes::Kind::Own => upstream::available() && !routes::is_penalised(routes::Kind::Own),
+        routes::Kind::Exits => exits_available(),
+        routes::Kind::Relay => relay_usable(),
+        routes::Kind::Direct => direct_usable(host),
+    }
+}
+
+/// The direct tunnel reaches something useful when the relay last answered the
+/// name with a substituted address, or when the client is inside a tunnel and
+/// the tunnel decides (D13) - and in neither case while a region 400 just came
+/// through it. An unanswered name gets the benefit of the doubt, as the rules
+/// do (S37): a needless hop costs one connection, a missing route costs every
+/// request.
+fn direct_usable(host: &str) -> bool {
+    if routes::is_penalised(routes::Kind::Direct) {
+        return false;
+    }
+    if crate::resolvers::vpn_is_active() {
+        return true;
+    }
+    !matches!(
+        crate::resolvers::served_verdict(host),
+        Some(crate::resolvers::Verdict::Passthrough) | Some(crate::resolvers::Verdict::Sibling)
+    )
+}
+
+#[cfg(exits)]
+fn exits_available() -> bool {
+    exits::available()
+}
+
+#[cfg(not(exits))]
+fn exits_available() -> bool {
+    false
+}
+
+#[cfg(relay)]
+fn relay_usable() -> bool {
+    relay::relay_available() && !relay::relay_is_benched()
+}
+
+#[cfg(not(relay))]
+fn relay_usable() -> bool {
+    // The stub says false; asked through it so a public build keeps the one
+    // symbol the rest of the crate is written against.
+    relay_available()
+}
+
+/// The host the direct-route probe asks for: the one the IDE actually uses, so
+/// the row measures the path a request takes.
+const DIRECT_PROBE_HOST: &str = "daily-cloudcode-pa.googleapis.com";
+/// Longest the probe's own request may take once connected.
+const DIRECT_PROBE_BUDGET: Duration = Duration::from_secs(15);
+
+/// Times the direct route the way the other routes are timed: connect, TLS to
+/// Google, one small request, an answer. Feeds the `Direct` row of the route
+/// table; run on the warm loop, never with a client's request (I38).
+///
+/// Resolves through the relay's own pool, so it measures the address a client
+/// would be handed - a substituted proxy normally, the tunnel's genuine Google
+/// while the relay stands down for a VPN.
+pub fn probe_direct(if_index: u32) {
+    let started = Instant::now();
+    match probe_direct_once(if_index) {
+        Ok(()) => routes::record(routes::Kind::Direct, started.elapsed()),
+        Err(why) => {
+            routes::record_failure(routes::Kind::Direct);
+            crate::dns_forwarder::log_proxy(&format!("напрямую не отвечает: {}", why));
+        }
+    }
+}
+
+fn probe_direct_once(if_index: u32) -> Result<(), String> {
+    let (addrs, _, _) = crate::resolvers::resolve_a_best(DIRECT_PROBE_HOST, if_index)
+        .ok_or_else(|| "имя не разрешилось".to_string())?;
+    let deadline = Instant::now() + DIRECT_OPEN_BUDGET;
+    let slice = (DIRECT_OPEN_BUDGET / addrs.len().max(1) as u32).max(Duration::from_secs(1));
+    let mut sock = None;
+    for a in addrs {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        if let Ok(s) =
+            TcpStream::connect_timeout(&std::net::SocketAddr::from((a, 443)), slice.min(left))
+        {
+            sock = Some(s);
+            break;
+        }
+    }
+    let mut sock = sock.ok_or_else(|| "не подключиться".to_string())?;
+    sock.set_read_timeout(Some(DIRECT_PROBE_BUDGET)).ok();
+    sock.set_write_timeout(Some(DIRECT_PROBE_BUDGET)).ok();
+    let name =
+        rustls::pki_types::ServerName::try_from(DIRECT_PROBE_HOST).map_err(|e| e.to_string())?;
+    let mut tls = ClientConnection::new(probe_config(), name).map_err(|e| e.to_string())?;
+    let mut stream = rustls::Stream::new(&mut tls, &mut sock);
+    let req = format!(
+        "GET /v1internal:probe HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        DIRECT_PROBE_HOST
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("рукопожатие: {}", e))?;
+    let mut buf = [0u8; 64];
+    let n = stream
+        .read(&mut buf)
+        .map_err(|e| format!("ответа нет: {}", e))?;
+    if n > 0 && buf.starts_with(b"HTTP/") {
+        Ok(())
+    } else {
+        Err("ответ не похож на HTTP".to_string())
+    }
 }
 
 /// `CONNECT host:port HTTP/1.1` and the headers after it, up to the blank line.
@@ -303,7 +489,7 @@ fn would_block(e: &io::Error) -> bool {
 
 /// Raw byte tunnel, for everything this proxy has no business decrypting.
 fn tunnel(mut client: TcpStream, host: &str, port: u16) {
-    let Ok(upstream) = TcpStream::connect((host, port)) else {
+    let Ok(upstream) = connect_bounded(host, port, TUNNEL_OPEN_BUDGET) else {
         // The client is still waiting for a status line; without one it sits
         // there until it gives up, which reads as "the proxy hung" rather than
         // "that host is unreachable".
@@ -458,43 +644,62 @@ fn serve(mut client: TcpStream, _if_index: u32) {
         Request::Gone => return,
     };
 
-    // Four routes for a gate host, best first, each handing the client back
-    // untouched if it cannot serve it:
+    // Four routes for a gate host, each handing the client back untouched if it
+    // cannot serve it, in the order the route table puts them (routes.rs):
     //
-    //   1. the user's own proxy, when they gave us one. It stays first even though
-    //      the built-in exits below are usually faster: they typed it in by hand,
-    //      it is theirs rather than a third party we chose for them, and silently
-    //      overriding what somebody configured is not a speed optimisation. Almost
-    //      nobody sets one, so in practice route 2 is the first that runs.
-    //   2. a built-in exit - somebody else's CONNECT proxy that already egresses
-    //      in a permitted region, so it lifts the gate outright (S25) with no DNS
-    //      trickery, no credential and no certificate. Measured faster than the
-    //      relay and several times faster than the DNS route (kb/dns.md).
-    //   3. the relay, cert-free but somebody else's and revocable.
-    //   4. a plain direct tunnel, which the DNS layer has already pointed at a
-    //      substituted address.
+    //   - the user's own proxy, when they gave us one, always first. They typed
+    //     it in by hand, it is theirs rather than a third party we chose for
+    //     them, and silently overriding what somebody configured is not a speed
+    //     optimisation.
+    //   - the rest by measured speed: a plain direct tunnel to the address the
+    //     DNS layer substituted (0.28 s when last measured), a built-in exit -
+    //     somebody else's CONNECT proxy in a permitted region, which lifts the
+    //     gate outright (S25) - and the relay, cert-free but revocable.
     //
-    // Nothing is decided before `200 Connection Established` goes out, so falling
-    // from one to the next costs the client nothing (I35).
-    let client = match try_own_proxy(client, &host, port) {
-        Ok(()) => return,
-        Err(returned) => returned,
-    };
-    let client = match try_builtin_exit(client, &host, port) {
-        Ok(()) => return,
-        Err(returned) => returned,
-    };
-    let client = match try_relay_route(client, &host, port) {
-        Ok(()) => return,
-        Err(returned) => returned,
-    };
+    // The table, not a fixed ladder, because the ladder was a guess about speed
+    // that the measurements contradicted (kb/rivals.md Fact 3); and a route
+    // that just carried a region 400 goes to the back (ls_log). Nothing is
+    // decided before `200 Connection Established` goes out, so falling from
+    // one to the next costs the client nothing (I35), and a tunnel already
+    // open keeps its route whatever the table says next.
+    if port == 443 && is_gate_host(&host) {
+        let mut client = client;
+        let mut tried_direct = false;
+        for kind in routes::order(|k| route_usable(k, &host)) {
+            let attempt = match kind {
+                routes::Kind::Own => try_own_proxy(client, &host, port),
+                routes::Kind::Exits => try_builtin_exit(client, &host, port),
+                routes::Kind::Relay => try_relay_route(client, &host, port),
+                routes::Kind::Direct => {
+                    tried_direct = true;
+                    try_direct(client, &host, port)
+                }
+            };
+            client = match attempt {
+                Ok(()) => return,
+                Err(returned) => returned,
+            };
+        }
+        // Every route refused. The plain tunnel is the last resort when the
+        // table left it out - a genuine Google address that answers 400 is
+        // still better than a client that gets no status line at all. When the
+        // direct route was already tried and found nothing, trying the same
+        // name again only delays the 502 by another budget.
+        if tried_direct {
+            client.write_all(RESP_BAD_GATEWAY).ok();
+            return;
+        }
+        client.set_read_timeout(None).ok();
+        tunnel(client, &host, port);
+        return;
+    }
 
     // Everything that is not a gate host is a plain direct tunnel - including
     // every other `*.googleapis.com` (e.g. `storage.googleapis.com`, which the
     // Desktop app loads at startup). The proxy terminates no TLS and holds no CA:
     // MITMing those hosts with a certificate no client trusts is exactly what
     // black-screened the Desktop app with `BadCertificate`. The gate hosts are
-    // reached cert-free through the relay above; nothing here needs a CA.
+    // reached cert-free through the routes above; nothing here needs a CA.
     client.set_read_timeout(None).ok();
     tunnel(client, &host, port);
 }
