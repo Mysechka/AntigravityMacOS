@@ -214,8 +214,13 @@ def _win_to_wsl_path(win_path):
 # asked for more than GLIBC_2.34.
 #
 # cargo-zigbuild pins the baseline at link time, so this needs no second distro.
-# 2.36 = Debian 12, and every newer distro is covered by compatibility.
-LINUX_GLIBC = "2.36"
+# 2.34 is the floor the code itself sets - it is the highest version any remaining
+# symbol asks for, so linking there costs nothing and is as low as this binary can
+# go without dropping a symbol it actually uses. Covers RHEL 9 and Fedora 35 up,
+# and everything newer (Ubuntu 22.04 = 2.35, Debian 12 = 2.36) by compatibility.
+# Raise it only if a build starts failing to link, never to make a build pass
+# quietly: `linux_glibc_baseline` below is what proves the pin held.
+LINUX_GLIBC = "2.34"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
 
 
