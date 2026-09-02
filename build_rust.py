@@ -202,6 +202,51 @@ def _win_to_wsl_path(win_path):
     return "/mnt/%s%s" % (drive.rstrip(":").lower(), rest)
 
 
+# Oldest glibc the Linux bundle has to start on.
+#
+# glibc is backward compatible but not forward, and the baseline is decided by
+# where the binary is *linked*, not by what it calls. Built natively on Ubuntu
+# 26.04 (glibc 2.43), `_4`'s ELF picked up a GLIBC_2.39 version reference for two
+# `pidfd_*` symbols out of Rust std's process-spawn fast path. The symbols
+# themselves are weak and std falls back without them - but the `.gnu.version_r`
+# entry is `Flags: none`, so ld.so refuses to start the file at all on anything
+# older: `version 'GLIBC_2.39' not found`, before main. Nothing else in the binary
+# asked for more than GLIBC_2.34.
+#
+# cargo-zigbuild pins the baseline at link time, so this needs no second distro.
+# 2.36 = Debian 12, and every newer distro is covered by compatibility.
+LINUX_GLIBC = "2.36"
+LINUX_TARGET = "x86_64-unknown-linux-gnu"
+
+
+def _version_tuple(v):
+    """"2.36" -> (2, 36), so glibc versions compare numerically and 2.9 does not
+    outrank 2.36 the way a string compare would."""
+    out = []
+    for part in str(v).split("."):
+        try:
+            out.append(int(part))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
+
+
+def linux_glibc_baseline(distro, elf_wsl_path):
+    """The highest GLIBC_x.y the ELF asks ld.so for - i.e. the oldest distro it
+    actually starts on. Measured, not assumed: the 2.39 above was invisible until
+    someone looked, and a silent baseline creep is exactly the failure that ships.
+    Returns the version string, or None when binutils is not there to ask."""
+    res = _wsl_run(
+        distro,
+        "objdump -T '%s' 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1"
+        % elf_wsl_path,
+    )
+    if not res or res.returncode != 0:
+        return None
+    found = (res.stdout or "").strip()
+    return found[len("GLIBC_"):] if found.startswith("GLIBC_") else None
+
+
 def build_linux_bundle(version):
     """Builds the Linux ELF in WSL and assembles release/AG_<ver>_linux/ (+ .tar.gz)
     with the double-click launcher assets. Best-effort; returns the bundle dir or
@@ -218,11 +263,34 @@ def build_linux_bundle(version):
         print(f"[INFO] Сборка Linux-версии в WSL ({distro})...")
 
         repo_wsl = _win_to_wsl_path(os.getcwd())
+        probe = _wsl_run(
+            distro,
+            '. "$HOME/.cargo/env" 2>/dev/null; '
+            "command -v cargo-zigbuild >/dev/null && echo OK",
+        )
+        has_zigbuild = bool(probe and probe.returncode == 0 and "OK" in (probe.stdout or ""))
+
         # Separate target dir so it never collides with the Windows target/.
-        build_cmd = (
-            'set -e; . "$HOME/.cargo/env"; cd "%s"; '
-            "cargo build --release --bin ag_unlocker --target-dir target-linux 2>&1 | tail -3"
-            % repo_wsl
+        if has_zigbuild:
+            cargo_cmd = (
+                "cargo zigbuild --release --bin ag_unlocker "
+                "--target %s.%s --target-dir target-linux" % (LINUX_TARGET, LINUX_GLIBC)
+            )
+            elf = os.path.join("target-linux", LINUX_TARGET, "release", "ag_unlocker")
+        else:
+            # Still build - the bundle is better than no bundle - but say plainly
+            # what the fallback costs, because the damage is invisible in the
+            # output and lands on the user's machine as a refusal to start.
+            print(f"[WARNING] cargo-zigbuild не найден в WSL - собираю нативно. Бандл "
+                  f"потребует glibc сборочной машины, а не {LINUX_GLIBC}, и не запустится "
+                  f"на дистрибутивах старше неё.")
+            print("          Поставить: pip3 install --user --break-system-packages ziglang "
+                  "&& cargo install cargo-zigbuild")
+            cargo_cmd = "cargo build --release --bin ag_unlocker --target-dir target-linux"
+            elf = os.path.join("target-linux", "release", "ag_unlocker")
+
+        build_cmd = 'set -e; . "$HOME/.cargo/env"; cd "%s"; %s 2>&1 | tail -3' % (
+            repo_wsl, cargo_cmd,
         )
         res = _wsl_run(distro, build_cmd, capture=True)
         if res.stdout:
@@ -231,10 +299,21 @@ def build_linux_bundle(version):
             print("[WARNING] Linux-сборка не удалась (см. вывод выше) - отгружён только .exe.")
             return None
 
-        elf = os.path.join("target-linux", "release", "ag_unlocker")
         if not os.path.exists(elf):
             print(f"[WARNING] ELF не найден по пути {elf} - Linux-бандл не собран.")
             return None
+
+        # Report the baseline that was actually produced, and complain when it is
+        # not the one asked for - the whole point of pinning it is lost if nobody
+        # checks (that is how the GLIBC_2.39 bundle shipped).
+        baseline = linux_glibc_baseline(distro, f"{repo_wsl}/{elf.replace(os.sep, '/')}")
+        if baseline is None:
+            print("[i] Планку glibc проверить нечем (нет objdump в WSL).")
+        elif has_zigbuild and _version_tuple(baseline) > _version_tuple(LINUX_GLIBC):
+            print(f"[WARNING] ELF требует glibc {baseline}, хотя собирался под "
+                  f"{LINUX_GLIBC} - планка не удержана, проверьте цель сборки.")
+        else:
+            print(f"[INFO] Linux-бандл требует glibc {baseline} и старше.")
 
         bundle = os.path.abspath(os.path.join("release", f"AG_{version}_linux"))
         if os.path.exists(bundle):
