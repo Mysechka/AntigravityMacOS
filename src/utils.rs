@@ -244,26 +244,15 @@ pub fn run_macos_launchctl(args: &[&str]) -> std::process::Output {
         }
     }
 
-    match Command::new("launchctl").args(args).output() {
-        Ok(out) => out,
-        Err(e) => {
-            // Dummy fallback if launchctl cannot be spawned
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::ExitStatusExt;
-                std::process::Output {
-                    status: std::process::ExitStatus::from_raw(1),
-                    stdout: Vec::new(),
-                    stderr: e.to_string().into_bytes(),
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = e;
-                Command::new("true").output().unwrap()
-            }
-        }
-    }
+    Command::new("launchctl")
+        .args(args)
+        .output()
+        .unwrap_or_else(|_| {
+            Command::new("/bin/sh")
+                .args(["-c", "exit 1"])
+                .output()
+                .unwrap()
+        })
 }
 
 /// A path short enough to sit in a progress line: the last few components,

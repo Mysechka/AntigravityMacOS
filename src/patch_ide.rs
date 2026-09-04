@@ -39,10 +39,12 @@ fn backup_once(target: &Path) {
 pub fn prepare_macos_target(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::process::Command::new("chflags")
-        .args(["nouchg", &path.to_string_lossy()])
+        .arg("nouchg")
+        .arg(path)
         .status();
     let _ = std::process::Command::new("xattr")
-        .args(["-d", "com.apple.quarantine", &path.to_string_lossy()])
+        .args(["-d", "com.apple.quarantine"])
+        .arg(path)
         .status();
     if let Ok(m) = fs::metadata(path) {
         let mode = m.permissions().mode();
@@ -52,7 +54,8 @@ pub fn prepare_macos_target(path: &Path) {
     }
     if let Some(parent) = path.parent() {
         let _ = std::process::Command::new("chflags")
-            .args(["nouchg", &parent.to_string_lossy()])
+            .arg("nouchg")
+            .arg(parent)
             .status();
         if let Ok(m) = fs::metadata(parent) {
             let mode = m.permissions().mode();

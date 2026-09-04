@@ -518,14 +518,20 @@ mod macos_impl {
 
         if let Ok(user) = std::env::var("SUDO_USER") {
             if !user.is_empty() && user != "root" {
+                let owner = format!("{}:staff", user);
                 let _ = Command::new("chown")
-                    .args(["-R", &format!("{}:staff", user), &dir.to_string_lossy()])
+                    .arg("-R")
+                    .arg(&owner)
+                    .arg(&dir)
                     .status();
                 let _ = Command::new("chown")
-                    .args([&format!("{}:staff", user), &pp.to_string_lossy()])
+                    .arg(&owner)
+                    .arg(&pp)
                     .status();
                 let _ = Command::new("chown")
-                    .args(["-R", &format!("{}:staff", user), &log_dir.to_string_lossy()])
+                    .arg("-R")
+                    .arg(&owner)
+                    .arg(&log_dir)
                     .status();
             }
         }
