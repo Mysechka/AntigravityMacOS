@@ -213,9 +213,9 @@ pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
 /// `language_server*` file - whatever the exact suffix, the signature scan then
 /// decides whether it is really a target.
 pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
-    let resources_bin = inst.join("resources").join("bin");
-    let ext_bin = inst
-        .join("resources")
+    let res = crate::utils::resources_dir(inst);
+    let resources_bin = res.join("bin");
+    let ext_bin = res
         .join("app")
         .join("extensions")
         .join("antigravity")
@@ -232,6 +232,13 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
         ext_bin.join("language_server_windows_x64.exe"),
         ext_bin.join("language_server.exe"),
     ];
+
+    #[cfg(target_os = "macos")]
+    {
+        let macos_dir = inst.join("Contents").join("MacOS");
+        targets.push(macos_dir.join("agy"));
+        targets.push(macos_dir.join("language_server"));
+    }
 
     // Any other `language_server*` in the two bin dirs - catches the Linux/macOS
     // platform-suffixed names (`language_server_linux_x64`, `..._darwin_arm64`, …)
@@ -307,7 +314,7 @@ fn kill_platform_processes() {
 fn kill_platform_processes() {
     // -f matches against the whole command line, so a full install path still
     // matches; the patterns are the binary basenames the patcher targets.
-    let patterns = ["language_server", "/agy"];
+    let patterns = ["language_server", "/agy", "Antigravity CLI"];
     for pat in patterns.iter() {
         Command::new("pkill")
             .args(["-f", pat])

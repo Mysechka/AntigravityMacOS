@@ -91,8 +91,8 @@ fn restore_js(target: &Path) -> Result<bool, String> {
 /// Returns how many files it restored.
 pub fn unpatch_ide_js(inst: &Path) -> usize {
     let mut n = 0;
-    let main_js = inst
-        .join("resources")
+    let res = crate::utils::resources_dir(inst);
+    let main_js = res
         .join("app")
         .join("out")
         .join("main.js");
@@ -106,8 +106,7 @@ pub fn unpatch_ide_js(inst: &Path) -> usize {
             Err(e) => println!("  \x1b[33m[ERR] main.js: {}\x1b[0m\x1b[92m", e),
         }
     }
-    let ext = inst
-        .join("resources")
+    let ext = res
         .join("app")
         .join("extensions")
         .join("antigravity")
@@ -647,8 +646,7 @@ mod tests {
 }
 
 pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
-    let ext_path = inst
-        .join("resources")
+    let ext_path = crate::utils::resources_dir(inst)
         .join("app")
         .join("extensions")
         .join("antigravity")

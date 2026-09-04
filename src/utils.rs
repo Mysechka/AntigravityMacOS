@@ -131,7 +131,25 @@ pub fn link(url: &str, text: &str) -> String {
     }
 }
 
-// Open a URL in the system default browser (Windows: cmd /c start "" <url>).
+/// Locates the resources directory for an IDE installation.
+/// On macOS Electron apps, resources live inside Contents/Resources.
+/// On Linux/Windows, resources live directly in resources/.
+pub fn resources_dir(inst: &std::path::Path) -> std::path::PathBuf {
+    if inst.file_name().map_or(false, |n| n == "Resources" || n == "resources") {
+        return inst.to_path_buf();
+    }
+    let cr = inst.join("Contents").join("Resources");
+    if cr.exists() {
+        return cr;
+    }
+    #[cfg(target_os = "macos")]
+    if inst.extension().map_or(false, |ext| ext == "app") {
+        return cr;
+    }
+    inst.join("resources")
+}
+
+// Open a URL in the system default browser (Windows: cmd /c start "" <url>, macOS: open <url>, Linux: xdg-open <url>).
 pub fn open_url(url: &str) {
     #[cfg(target_os = "windows")]
     {
@@ -140,7 +158,11 @@ pub fn open_url(url: &str) {
             .status()
             .ok();
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(url).status().ok();
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         Command::new("xdg-open").arg(url).status().ok();
     }
