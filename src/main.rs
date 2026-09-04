@@ -535,12 +535,26 @@ fn process_install(install: &Path) -> Result<String, String> {
                 e
             );
         }
+        #[cfg(target_os = "macos")]
+        if install.extension().map_or(false, |ext| ext == "app") {
+            let _ = std::process::Command::new("codesign")
+                .args(["--force", "--deep", "-s", "-"])
+                .arg(install)
+                .status();
+        }
         return Ok("Antigravity IDE".to_string());
     } else if desktop_js.exists() {
         let js_patched = patch_desktop(install, &desktop_js)?;
         if !js_patched {
             // v2.4+ unpacked by an older build of this tool: undo the unpack.
             restore_pristine_asar(&resources)?;
+        }
+        #[cfg(target_os = "macos")]
+        if install.extension().map_or(false, |ext| ext == "app") {
+            let _ = std::process::Command::new("codesign")
+                .args(["--force", "--deep", "-s", "-"])
+                .arg(install)
+                .status();
         }
         return Ok("Antigravity Desktop".to_string());
     } else if install.join("agy.exe").is_file() || install.join("agy").is_file() {

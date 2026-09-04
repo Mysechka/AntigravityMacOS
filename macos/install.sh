@@ -87,10 +87,11 @@ cp -f "$BIN" "$APP_DIR/ag_unlocker"
 chmod 0755 "$APP_DIR/ag_unlocker"
 xattr -d com.apple.quarantine "$APP_DIR/ag_unlocker" 2>/dev/null || true
 
-# Снятие карантина с установленных приложений Antigravity (обход блокировок Gatekeeper)
+# Снятие карантина и ad-hoc подпись установленных приложений Antigravity (обход блокировок Gatekeeper и краша ARM64)
 for app in "/Applications/Antigravity IDE.app" "/Applications/Antigravity.app" "$HOME/Applications/Antigravity IDE.app" "$HOME/Applications/Antigravity.app"; do
     if [ -d "$app" ]; then
         xattr -dr com.apple.quarantine "$app" 2>/dev/null || true
+        codesign --force --deep -s - "$app" 2>/dev/null || true
     fi
 done
 

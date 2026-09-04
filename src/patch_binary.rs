@@ -125,20 +125,46 @@ fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
             .unwrap_or(0o755);
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
     }
-    match fs::rename(&tmp, bin_path) {
+    let res = match fs::rename(&tmp, bin_path) {
         Ok(()) => Ok(()),
         Err(e) => {
             #[cfg(target_os = "macos")]
             {
                 crate::patch_ide::prepare_macos_target(bin_path);
                 if fs::rename(&tmp, bin_path).is_ok() {
-                    return Ok(());
+                    Ok(())
+                } else {
+                    let _ = fs::remove_file(&tmp);
+                    Err(e)
                 }
             }
-            let _ = fs::remove_file(&tmp);
-            Err(e)
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    };
+
+    if res.is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(bin_path, fs::Permissions::from_mode(0o755));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // Re-sign the modified binary with ad-hoc signature so Apple Silicon / ARM64
+            // doesn't kill it with SIGKILL upon execution (code signing violation).
+            let _ = std::process::Command::new("codesign")
+                .args(["--force", "-s", "-"])
+                .arg(bin_path)
+                .status();
         }
     }
+
+    res
 }
 
 fn rewrite(bin_path: &Path, from: &str, to: &str) -> Result<usize, String> {
