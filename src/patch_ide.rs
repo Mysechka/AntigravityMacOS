@@ -35,6 +35,34 @@ fn backup_once(target: &Path) {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub fn prepare_macos_target(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::process::Command::new("chflags")
+        .args(["nouchg", &path.to_string_lossy()])
+        .status();
+    let _ = std::process::Command::new("xattr")
+        .args(["-d", "com.apple.quarantine", &path.to_string_lossy()])
+        .status();
+    if let Ok(m) = fs::metadata(path) {
+        let mode = m.permissions().mode();
+        if mode & 0o200 == 0 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o666));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::process::Command::new("chflags")
+            .args(["nouchg", &parent.to_string_lossy()])
+            .status();
+        if let Ok(m) = fs::metadata(parent) {
+            let mode = m.permissions().mode();
+            if mode & 0o200 == 0 {
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(mode | 0o777));
+            }
+        }
+    }
+}
+
 /// Writes `content` to `path` without a torn intermediate state: a sibling temp
 /// on the same directory, then a rename over the target (atomic replace on
 /// Windows and POSIX). A crash or power loss leaves either the old file or the
@@ -43,10 +71,40 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".agtmp");
     let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, content)?;
+    let _ = fs::remove_file(&tmp);
+
+    #[cfg(target_os = "macos")]
+    prepare_macos_target(path);
+
+    if let Err(e) = fs::write(&tmp, content) {
+        #[cfg(target_os = "macos")]
+        {
+            prepare_macos_target(path);
+            fs::write(&tmp, content)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err(e);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0o644);
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode | 0o644));
+    }
+
     match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
+            #[cfg(target_os = "macos")]
+            {
+                prepare_macos_target(path);
+                if fs::rename(&tmp, path).is_ok() {
+                    return Ok(());
+                }
+            }
             let _ = fs::remove_file(&tmp);
             Err(e)
         }

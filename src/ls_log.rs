@@ -177,9 +177,16 @@ fn profile_root() -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn profile_root() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+    let home = if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() && user != "root" {
+            format!("/Users/{}", user)
+        } else {
+            std::env::var("HOME").ok()?
+        }
+    } else {
+        std::env::var("HOME").ok()?
+    };
+    Some(PathBuf::from(home).join("Library").join("Application Support"))
 }
 
 /// Linux keeps the same layout under `~/.config`; nothing tails it there yet

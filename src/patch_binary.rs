@@ -97,7 +97,21 @@ fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
     let mut tmp = bin_path.as_os_str().to_os_string();
     tmp.push(".agtmp");
     let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, data)?;
+    let _ = fs::remove_file(&tmp);
+
+    #[cfg(target_os = "macos")]
+    crate::patch_ide::prepare_macos_target(bin_path);
+
+    if let Err(e) = fs::write(&tmp, data) {
+        #[cfg(target_os = "macos")]
+        {
+            crate::patch_ide::prepare_macos_target(bin_path);
+            fs::write(&tmp, data)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err(e);
+    }
+
     // On Unix a fresh temp file is created 0644, and renaming it over the language
     // server would strip the execute bit - a non-executable binary the app then
     // cannot launch. Copy the original's mode onto the temp before the rename so
@@ -114,6 +128,13 @@ fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
     match fs::rename(&tmp, bin_path) {
         Ok(()) => Ok(()),
         Err(e) => {
+            #[cfg(target_os = "macos")]
+            {
+                crate::patch_ide::prepare_macos_target(bin_path);
+                if fs::rename(&tmp, bin_path).is_ok() {
+                    return Ok(());
+                }
+            }
             let _ = fs::remove_file(&tmp);
             Err(e)
         }

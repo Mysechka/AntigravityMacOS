@@ -69,7 +69,16 @@ pub fn ide_settings_path(install: &Path) -> Option<PathBuf> {
     let root = PathBuf::from(std::env::var("APPDATA").ok()?);
     #[cfg(target_os = "macos")]
     let root = {
-        PathBuf::from(std::env::var("HOME").ok()?).join("Library").join("Application Support")
+        let home = if let Ok(user) = std::env::var("SUDO_USER") {
+            if !user.is_empty() && user != "root" {
+                format!("/Users/{}", user)
+            } else {
+                std::env::var("HOME").ok()?
+            }
+        } else {
+            std::env::var("HOME").ok()?
+        };
+        PathBuf::from(home).join("Library").join("Application Support")
     };
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let root = {
@@ -232,17 +241,13 @@ pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
 /// On macOS, sets environment variables for GUI apps and user sessions using launchctl.
 #[cfg(target_os = "macos")]
 pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
-    use std::process::Command;
     for (k, v) in [
         (PROXY_ENV_VAR, url),
         ("https_proxy", url),
         (NO_PROXY_ENV_VAR, NO_PROXY_VALUE),
         ("no_proxy", NO_PROXY_VALUE),
     ] {
-        Command::new("launchctl")
-            .args(["setenv", k, v])
-            .status()
-            .ok();
+        crate::utils::run_macos_launchctl(&["setenv", k, v]);
     }
     Ok(Outcome::Applied)
 }
@@ -332,12 +337,8 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
 /// macOS: unsets proxy environment variables using launchctl.
 #[cfg(target_os = "macos")]
 pub fn remove_proxy(_url: &str, _ca_path: &str) -> Result<(), String> {
-    use std::process::Command;
     for k in [PROXY_ENV_VAR, "https_proxy", NO_PROXY_ENV_VAR, "no_proxy"] {
-        Command::new("launchctl")
-            .args(["unsetenv", k])
-            .status()
-            .ok();
+        crate::utils::run_macos_launchctl(&["unsetenv", k]);
     }
     Ok(())
 }
@@ -455,9 +456,16 @@ fn profile_root() -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn profile_root() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+    let home = if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() && user != "root" {
+            format!("/Users/{}", user)
+        } else {
+            std::env::var("HOME").ok()?
+        }
+    } else {
+        std::env::var("HOME").ok()?
+    };
+    Some(PathBuf::from(home).join("Library").join("Application Support"))
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]

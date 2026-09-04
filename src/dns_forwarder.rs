@@ -159,7 +159,15 @@ pub fn log_dir() -> PathBuf {
 /// On macOS, logs live in ~/Library/Logs/agunlocker.
 #[cfg(target_os = "macos")]
 pub fn log_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() && user != "root" {
+            format!("/Users/{}", user)
+        } else {
+            std::env::var("HOME").unwrap_or_default()
+        }
+    } else {
+        std::env::var("HOME").unwrap_or_default()
+    };
     PathBuf::from(home).join("Library").join("Logs").join("agunlocker")
 }
 

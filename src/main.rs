@@ -507,6 +507,8 @@ fn process_install(install: &Path) -> Result<String, String> {
     let desktop_js = app_dir.join("dist").join("main.js");
 
     if ide_js.exists() {
+        // Re-scan and patch binaries that were newly unpacked from the archive
+        let _ = patch_all_binaries(install);
         patch_ide(install, &ide_js)?;
         if let Err(e) = patch_extension_js(install) {
             // Not reported per install: the progress line is one row wide, and

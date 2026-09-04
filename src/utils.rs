@@ -195,9 +195,74 @@ pub fn mask_path(path: &str) -> String {
 /// Same idea on Linux, where the one directory worth eliding is the home dir.
 #[cfg(not(target_os = "windows"))]
 pub fn mask_path(path: &str) -> String {
+    if let Ok(user) = env::var("SUDO_USER") {
+        if !user.is_empty() && user != "root" {
+            let user_home = format!("/Users/{}", user);
+            if path.starts_with(&user_home) {
+                return path.replace(&user_home, "~");
+            }
+        }
+    }
     match env::var("HOME") {
         Ok(home) if !home.is_empty() => path.replace(&home, "~"),
         _ => path.to_string(),
+    }
+}
+
+/// Runs a launchctl subcommand targeting the real GUI user session when executed
+/// under sudo, avoiding SIP errors (error 150) and LaunchAgent mismatch (error 5).
+#[cfg(target_os = "macos")]
+pub fn run_macos_launchctl(args: &[&str]) -> std::process::Output {
+    let target_uid = env::var("SUDO_UID")
+        .ok()
+        .filter(|u| !u.is_empty() && u != "0")
+        .or_else(|| {
+            env::var("SUDO_USER")
+                .ok()
+                .filter(|u| !u.is_empty() && u != "root")
+                .and_then(|user| {
+                    Command::new("id")
+                        .args(["-u", &user])
+                        .output()
+                        .ok()
+                        .and_then(|out| {
+                            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if !s.is_empty() && s != "0" {
+                                Some(s)
+                            } else {
+                                None
+                            }
+                        })
+                })
+        });
+
+    if let Some(ref uid) = target_uid {
+        let mut full_args = vec!["asuser", uid.as_str(), "launchctl"];
+        full_args.extend_from_slice(args);
+        if let Ok(out) = Command::new("launchctl").args(&full_args).output() {
+            return out;
+        }
+    }
+
+    match Command::new("launchctl").args(args).output() {
+        Ok(out) => out,
+        Err(e) => {
+            // Dummy fallback if launchctl cannot be spawned
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                std::process::Output {
+                    status: std::process::ExitStatus::from_raw(1),
+                    stdout: Vec::new(),
+                    stderr: e.to_string().into_bytes(),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = e;
+                Command::new("true").output().unwrap()
+            }
+        }
     }
 }
 
@@ -341,6 +406,25 @@ pub fn print_results(successes: &[String], failures: &[String]) {
         println!("{}", "Ошибки:");
         for f in failures {
             println!("  \x1b[33m[-] {}\x1b[0m\x1b[92m", f);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let has_perm_err = failures.iter().any(|f| {
+                f.contains("Operation not permitted")
+                    || f.contains("os error 1")
+                    || f.contains("TCC")
+            });
+            if has_perm_err {
+                println!("\n  \x1b[36m────────────────────────────────────────────────────────────\x1b[0m");
+                println!("  \x1b[1;33m[!] КАК ИСПРАВИТЬ «Operation not permitted (os error 1)»:\x1b[0m");
+                println!("  \x1b[37mmacOS блокирует изменение файлов в /Applications защитой TCC.\x1b[0m");
+                println!("  \x1b[32m1.\x1b[0m Откройте «Системные настройки» -> «Конфиденциальность и безопасность»");
+                println!("  \x1b[32m2.\x1b[0m Перейдите в раздел «Полный доступ к диску» (Full Disk Access)");
+                println!("  \x1b[32m3.\x1b[0m Включите тумблер для вашего Терминала (Terminal или iTerm)");
+                println!("  \x1b[32m4.\x1b[0m Перезапустите Терминал и запустите установщик снова");
+                println!("  \x1b[36m────────────────────────────────────────────────────────────\x1b[0m");
+            }
         }
     }
     println!(

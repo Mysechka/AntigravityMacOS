@@ -430,6 +430,11 @@ mod macos_impl {
     const PLIST_NAME: &str = "com.antigravity.proxy.plist";
 
     fn home() -> String {
+        if let Ok(user) = std::env::var("SUDO_USER") {
+            if !user.is_empty() && user != "root" {
+                return format!("/Users/{}", user);
+            }
+        }
         std::env::var("HOME").unwrap_or_default()
     }
 
@@ -450,11 +455,7 @@ mod macos_impl {
     }
 
     pub fn is_running() -> bool {
-        Command::new("launchctl")
-            .args(["list", LABEL])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        crate::utils::run_macos_launchctl(&["list", LABEL]).status.success()
     }
 
     pub fn relay_is_outdated() -> bool {
@@ -515,18 +516,29 @@ mod macos_impl {
 
         fs::write(&pp, plist_content).map_err(|e| format!("не записать plist: {}", e))?;
 
-        // Unload first in case it's currently loaded
-        Command::new("launchctl")
-            .args(["unload", "-w"])
-            .arg(&pp)
-            .output()
-            .ok();
+        if let Ok(user) = std::env::var("SUDO_USER") {
+            if !user.is_empty() && user != "root" {
+                let _ = Command::new("chown")
+                    .args(["-R", &format!("{}:staff", user), &dir.to_string_lossy()])
+                    .status();
+                let _ = Command::new("chown")
+                    .args([&format!("{}:staff", user), &pp.to_string_lossy()])
+                    .status();
+                let _ = Command::new("chown")
+                    .args(["-R", &format!("{}:staff", user), &log_dir.to_string_lossy()])
+                    .status();
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&pp, fs::Permissions::from_mode(0o644));
+        }
 
-        let status = Command::new("launchctl")
-            .args(["load", "-w"])
-            .arg(&pp)
-            .status()
-            .map_err(|e| format!("не удалось вызвать launchctl: {}", e))?;
+        // Unload first in case it's currently loaded
+        let _ = crate::utils::run_macos_launchctl(&["unload", "-w", &pp.to_string_lossy()]);
+
+        let status = crate::utils::run_macos_launchctl(&["load", "-w", &pp.to_string_lossy()]).status;
 
         if status.success() {
             Ok(())
@@ -547,11 +559,7 @@ mod macos_impl {
 
     pub fn disable() -> Result<(), String> {
         let pp = plist_path();
-        Command::new("launchctl")
-            .args(["unload", "-w"])
-            .arg(&pp)
-            .output()
-            .ok();
+        let _ = crate::utils::run_macos_launchctl(&["unload", "-w", &pp.to_string_lossy()]);
         let _ = fs::remove_file(&pp);
         let _ = fs::remove_file(installed_exe());
         let _ = fs::remove_dir(install_dir());
