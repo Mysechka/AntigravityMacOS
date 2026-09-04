@@ -296,7 +296,7 @@ fn try_own_proxy(mut client: TcpStream, host: &str, port: u16) -> Result<(), Tcp
 /// Longest the direct route may spend connecting to a gate host before the next
 /// route deserves the client. Spread across every address the name resolves to,
 /// so a black-holing first address does not spend it all (G7).
-const DIRECT_OPEN_BUDGET: Duration = Duration::from_secs(4);
+const DIRECT_OPEN_BUDGET: Duration = Duration::from_secs(10);
 /// The same for a host that has no other route: long enough for a slow edge,
 /// short enough that an abandoned socket does not hold a thread for Windows'
 /// own 21 s per address.
