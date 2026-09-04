@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -252,7 +252,10 @@ fn upstream_config() -> Arc<ClientConfig> {
 /// copy of a list like this drifts.
 pub fn is_gate_host(host: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
-    h == "cloudcode-pa.googleapis.com" || h == "daily-cloudcode-pa.googleapis.com"
+    h == "cloudcode-pa.googleapis.com"
+        || h == "daily-cloudcode-pa.googleapis.com"
+        || h == "generativelanguage.googleapis.com"
+        || h == "jetski-webchannel.googleapis.com"
 }
 
 /// Sends a gate host through the user's own proxy, when they gave us one and it
@@ -326,10 +329,26 @@ fn try_direct(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStr
 /// resolves to and giving each a slice rather than the remainder.
 fn connect_bounded(host: &str, port: u16, budget: Duration) -> Result<TcpStream, String> {
     let deadline = Instant::now() + budget;
-    let mut addrs: Vec<_> = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("имя не разрешается: {}", e))?
-        .collect();
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+
+    // On macOS / Linux there are no Windows NRPT rules to redirect DNS for gate hosts.
+    // Use our unblocking resolvers to get the substituted proxy IP for gate hosts.
+    #[cfg(not(target_os = "windows"))]
+    if is_gate_host(host) {
+        if let Some((v4_addrs, _, _)) = crate::resolvers::resolve_a_best(host, 0) {
+            addrs = v4_addrs
+                .into_iter()
+                .map(|ip| SocketAddr::from((ip, port)))
+                .collect();
+        }
+    }
+
+    if addrs.is_empty() {
+        addrs = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| format!("имя не разрешается: {}", e))?
+            .collect();
+    }
     if addrs.is_empty() {
         return Err("имя не разрешается".to_string());
     }
